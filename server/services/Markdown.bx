@@ -7,7 +7,8 @@
  * scroll on their own. Done once per save; posts.body_html holds the result.
  *
  * An image's title sets its size and caption: ![alt](src "wide"),
- * "half", "inline" (no figure), "caption: text", or "wide | text".
+ * "half", "inline" (no figure), "caption: text", or "wide | text"
+ * (see titleParts()).
  * Without a caption, the alt text is the caption.
  */
 class {
@@ -67,20 +68,10 @@ class {
 
 	private void function images( required body ) {
 		for ( var img in arguments.body.select( "img" ).toArray() ) {
-			var title   = img.attr( "title" )
-			var alt     = img.attr( "alt" )
-			var size    = ""
-			var caption = title
-			for ( var hint in static.SIZES ) {
-				if ( reFindNoCase( "\b#hint#\b", caption ) ) {
-					size    = hint
-					caption = trim( reReplaceNoCase( caption, "\b#hint#\b", "", "all" ) )
-					break
-				}
-			}
-			caption = reFindNoCase( "caption\s*:", caption )
-				? trim( reReplaceNoCase( caption, "^.*?caption\s*:\s*", "" ) )
-				: trim( reReplace( caption, "^[\s|,]+|[\s|,]+$", "", "all" ) )
+			var alt   = img.attr( "alt" )
+			var parts = titleParts( img.attr( "title" ) )
+			var size    = parts.size
+			var caption = parts.caption
 			if ( !len( caption ) && size != "inline" ) {
 				caption = alt
 			}
@@ -107,6 +98,35 @@ class {
 				figure.appendElement( "figcaption" ).text( caption )
 			}
 		}
+	}
+
+	/**
+	 * An image title's size and caption. The size is only ever a word of its
+	 * own: the whole title ("wide"), or before a "|" ("wide | A river") or
+	 * before "caption:" ("half caption: A river"). Everything else is caption,
+	 * so a caption may say "a wide river" and stay as written.
+	 */
+	private struct function titleParts( string title = "" ) {
+		var text = trim( arguments.title )
+		var head = text
+		var rest = ""
+		var bar = find( "|", text )
+		var marker = reFindNoCase( "caption\s*:", text )
+		if ( bar ) {
+			head = bar > 1 ? trim( left( text, bar - 1 ) ) : ""
+			rest = trim( mid( text, bar + 1, len( text ) ) )
+		} else if ( marker ) {
+			head = marker > 1 ? trim( left( text, marker - 1 ) ) : ""
+			rest = trim( mid( text, marker, len( text ) ) )
+		}
+		rest = trim( reReplaceNoCase( rest, "^caption\s*:\s*", "" ) )
+		for ( var hint in static.SIZES ) {
+			if ( compareNoCase( head, hint ) == 0 ) {
+				return { size: lcase( hint ), caption: rest }
+			}
+		}
+		// no size: the whole title is the caption, its marker taken off
+		return { size: "", caption: trim( reReplaceNoCase( text, "^caption\s*:\s*", "" ) ) }
 	}
 
 	private void function links( required body, required string siteHost ) {

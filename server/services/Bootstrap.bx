@@ -71,6 +71,10 @@ class {
 			uploadsDirectory : setting( "UPLOADS_DIR", static.ROOT & "/uploads" ),
 			insights : {
 				keepDays : int( setting( "REQUEST_LOG_DAYS", 90 ) )
+			},
+			limits : {
+				// per visitor's address (TRUST_PROXY_HEADER behind a proxy)
+				searchesPerMinute : int( setting( "SEARCHES_PER_MINUTE", 30 ) )
 			}
 		}
 		for ( var section in arguments.overrides ) {

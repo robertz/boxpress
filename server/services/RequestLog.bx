@@ -3,10 +3,10 @@
  *
  * Nothing in the middleware touches the database: each request appends a
  * struct to an in-memory queue (lock-free, safe for many threads) and
- * flush(), scheduled every few seconds by server.bxs, writes them in the
- * background. A slow or unreachable database delays the log, never a
- * response; past MAX_QUEUE the newest rows are dropped instead of growing
- * without bound.
+ * flush(), scheduled every few seconds by server.bxs, writes them all in
+ * the background, many rows to an INSERT. A slow or unreachable database
+ * delays the log, never a response; past MAX_QUEUE (the database down for
+ * a while) the newest rows are dropped instead of growing without bound.
  *
  * Static files (/assets, /uploads), health checks and the admin's own
  * polling aren't logged: they'd drown out the requests worth reading. No IP
@@ -21,8 +21,9 @@ class {
 	property name="flushes" type="numeric";
 
 	static {
-		MAX_QUEUE = 5000
-		MAX_BATCH = 500
+		MAX_QUEUE = 20000
+		// rows to an INSERT
+		CHUNK = 250
 		// prune old rows every this many flushes (about half an hour at five seconds)
 		PRUNE_EVERY = 360
 		SKIP = "^/(assets|uploads)/|^/(health|favicon\.ico|api/health|api/admin/server)$"
@@ -74,30 +75,22 @@ class {
 		}
 	}
 
-	/** Writes what's queued (at most MAX_BATCH). @return how many rows */
+	/** Writes everything queued, CHUNK rows to an INSERT. @return how many rows */
 	numeric function flush() {
 		var written = 0
 		try {
+			var batch = []
 			var entry = variables.queue.poll()
 			while ( !isNull( entry ) ) {
-				var referrerHost = len( entry.referrer )
-					? lcase( left( reReplace( entry.referrer, "^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?##:]+).*$", "\1" ), 255 ) )
-					: ""
-				variables.db.execute(
-					"INSERT INTO request_log ( requested_at, method, path, query_string, status_code, duration_ms, referrer, referrer_host, user_agent, is_bot )
-					VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )",
-					[
-						entry.requestedAt, entry.method, entry.path, entry.queryString,
-						isNumeric( entry.statusCode ) ? entry.statusCode : { value: "", sqltype: "integer", null: true },
-						entry.durationMs, entry.referrer, referrerHost, entry.userAgent,
-						variables.bots.isBot( entry.userAgent ) ? 1 : 0
-					]
-				)
-				written++
-				if ( written >= static.MAX_BATCH ) {
-					break
+				batch.append( entry )
+				if ( batch.len() >= static.CHUNK ) {
+					written += insertRows( batch )
+					batch = []
 				}
 				entry = variables.queue.poll()
+			}
+			if ( batch.len() ) {
+				written += insertRows( batch )
 			}
 			variables.flushes++
 			if ( variables.flushes >= static.PRUNE_EVERY ) {
@@ -110,11 +103,32 @@ class {
 		return written
 	}
 
+	private numeric function insertRows( required array rows ) {
+		var params = []
+		for ( var row in arguments.rows ) {
+			var referrerHost = len( row.referrer )
+				? lcase( left( reReplace( row.referrer, "^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?##:]+).*$", "\1" ), 255 ) )
+				: ""
+			params.append( [
+				row.requestedAt, row.method, row.path, row.queryString,
+				isNumeric( row.statusCode ) ? row.statusCode : { value: "", sqltype: "integer", null: true },
+				row.durationMs, row.referrer, referrerHost, row.userAgent,
+				variables.bots.isBot( row.userAgent ) ? 1 : 0
+			], true )
+		}
+		variables.db.execute(
+			"INSERT INTO request_log ( requested_at, method, path, query_string, status_code, duration_ms, referrer, referrer_host, user_agent, is_bot )
+			VALUES #arguments.rows.map( () => '( ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )' ).toList( ', ' )#",
+			params
+		)
+		return arguments.rows.len()
+	}
+
+	/** Removes requests and searches older than keepDays (daily summaries stay). @return requests removed */
 	numeric function prune() {
-		return variables.db.execute(
-			"DELETE FROM request_log WHERE requested_at < DATE_SUB( UTC_TIMESTAMP(), INTERVAL ? DAY )",
-			[ { value: variables.keepDays, sqltype: "integer" } ]
-		).recordCount
+		var days = [ { value: variables.keepDays, sqltype: "integer" } ]
+		variables.db.execute( "DELETE FROM search_log WHERE searched_at < DATE_SUB( UTC_TIMESTAMP(), INTERVAL ? DAY )", days )
+		return variables.db.execute( "DELETE FROM request_log WHERE requested_at < DATE_SUB( UTC_TIMESTAMP(), INTERVAL ? DAY )", days ).recordCount
 	}
 
 	/**

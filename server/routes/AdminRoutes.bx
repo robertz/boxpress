@@ -57,11 +57,8 @@ class {
 		arguments.router.patch( "/admin/users/:id", ( req, res ) => {
 			var target  = account( req )
 			var payload = Http::body( req )
-			if ( payload.keyExists( "role" ) ) {
-				if ( target.id == req.user.id && payload.role != "admin" ) {
-					ApiError::badRequest( "You can't take away your own admin role" )
-				}
-				users.setRole( target.id, AuthRoutes::optionalString( payload, "role" ) )
+			if ( payload.keyExists( "role" ) && target.id == req.user.id && AuthRoutes::optionalString( payload, "role" ) != "admin" ) {
+				ApiError::badRequest( "You can't take away your own admin role" )
 			}
 			if ( payload.keyExists( "disabled" ) ) {
 				if ( !Http::isBoolean( payload.disabled ) ) {
@@ -70,12 +67,9 @@ class {
 				if ( payload.disabled && target.id == req.user.id ) {
 					ApiError::badRequest( "You can't disable your own account" )
 				}
-				users.setDisabled( target.id, payload.disabled )
 			}
-			if ( payload.keyExists( "password" ) ) {
-				users.setPassword( target.id, isSimpleValue( payload.password ?: "" ) ? ( payload.password ?: "" ) : "" )
-			}
-			users.updateProfile( target.id, payload.filter( ( key ) => listFindNoCase( "displayName,bio,avatarUrl,website,email", key ) ) )
+			// all or nothing: a field that fails leaves the account as it was
+			users.adminUpdate( target.id, payload.filter( ( key ) => listFindNoCase( "displayName,bio,avatarUrl,website,email,role,disabled,password", key ) ) )
 			res.json( users.list( target.id )[ 1 ] )
 		} )
 

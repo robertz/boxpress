@@ -63,7 +63,13 @@ cp .env.example .env   # set SITE_URL, MYSQL_PASSWORD and MYSQL_ROOT_PASSWORD
 docker compose up -d --build
 ```
 
-Then sign in at `/admin` as **admin** / **admin** and change the password under Account straight away, or set `BOXPRESS_ADMIN_*` in `.env` before the first start to have your own account in its place.
+In production the default **admin** / **admin** account can't sign in until it has a password of its own, since that one is public. Set it on the server, then sign in at `/admin`:
+
+```bash
+docker compose exec app boxlang scripts/users.bxs password admin
+```
+
+Or set `BOXPRESS_ADMIN_*` in `.env` before the first start to have your own account in its place.
 
 The app listens on `127.0.0.1:8080`. Put a reverse proxy that terminates HTTPS in front of it, for example Caddy:
 

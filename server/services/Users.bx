@@ -148,6 +148,11 @@ class {
 		return "Created the first account, #arguments.username# (admin)#replacing ? ', in place of the default admin' : ''#"
 	}
 
+	/** Whether this is the default account signing in with its published password. */
+	boolean function isDefaultLogin( required struct user, required string password ) {
+		return compare( arguments.user.username, "admin" ) == 0 && compare( arguments.password, "admin" ) == 0
+	}
+
 	/** Whether the default account (admin / admin) can still sign in: the server warns while it can. */
 	boolean function defaultAdminActive() {
 		return !verify( "admin", "admin" ).isEmpty()
@@ -155,6 +160,57 @@ class {
 
 	/** { displayName?, bio?, avatarUrl?, website?, email? } for the account itself. */
 	void function updateProfile( required numeric id, required struct changes ) {
+		var update = profileChanges( arguments.id, arguments.changes )
+		if ( !update.sets.len() ) {
+			return
+		}
+		update.params.append( arguments.id )
+		variables.db.execute( "UPDATE users SET #update.sets.toList( ', ' )# WHERE id = ?", update.params )
+	}
+
+	/**
+	 * An admin's change to an account: the profile fields, and role?, disabled?
+	 * and password?. Everything is checked first and saved in one statement, so a
+	 * change that fails leaves the account as it was. Throws Users.Invalid,
+	 * Users.EmailTaken or Users.LastAdmin.
+	 */
+	void function adminUpdate( required numeric id, required struct changes ) {
+		var user = get( arguments.id )
+		if ( user.isEmpty() ) {
+			throw( type = "Users.NotFound", message = "No such user" )
+		}
+		var c = arguments.changes
+		var update = profileChanges( arguments.id, c )
+		var newRole = user.role
+		if ( c.keyExists( "role" ) ) {
+			newRole = stringOf( c.role )
+			validateRole( newRole )
+			update.sets.append( "role = ?" )
+			update.params.append( newRole )
+		}
+		var disabledNow = len( user.disabled_at ?: "" ) > 0
+		var willBeDisabled = c.keyExists( "disabled" ) ? c.disabled == true : disabledNow
+		if ( c.keyExists( "disabled" ) && willBeDisabled != disabledNow ) {
+			update.sets.append( "disabled_at = #willBeDisabled ? 'UTC_TIMESTAMP()' : 'NULL'#" )
+		}
+		if ( c.keyExists( "password" ) ) {
+			var password = stringOf( c.password )
+			validatePassword( password )
+			update.sets.append( "password_hash = ?" )
+			update.params.append( bcryptHash( password ) )
+		}
+		if ( isActiveAdmin( user ) && ( newRole != "admin" || willBeDisabled ) && adminCount() <= 1 ) {
+			throw( type = "Users.LastAdmin", message = "#user.username# is the only admin" )
+		}
+		if ( !update.sets.len() ) {
+			return
+		}
+		update.params.append( arguments.id )
+		variables.db.execute( "UPDATE users SET #update.sets.toList( ', ' )# WHERE id = ?", update.params )
+	}
+
+	/** The profile fields of a change, checked: { sets, params } for an UPDATE. Throws Users.Invalid or Users.EmailTaken. */
+	private struct function profileChanges( required numeric id, required struct changes ) {
 		var sets   = []
 		var params = []
 		var c      = arguments.changes
@@ -184,11 +240,7 @@ class {
 			sets.append( "email = ?" )
 			params.append( address )
 		}
-		if ( !sets.len() ) {
-			return
-		}
-		params.append( arguments.id )
-		variables.db.execute( "UPDATE users SET #sets.toList( ', ' )# WHERE id = ?", params )
+		return { sets: sets, params: params }
 	}
 
 	/** What the public and the admin's lists show of an account. */
@@ -244,7 +296,7 @@ class {
 	void function setRole( required numeric id, required string role ) {
 		validateRole( arguments.role )
 		var user = get( arguments.id )
-		if ( arguments.role != "admin" && ( user.role ?: "" ) == "admin" && adminCount() <= 1 ) {
+		if ( arguments.role != "admin" && isActiveAdmin( user ) && adminCount() <= 1 ) {
 			throw( type = "Users.LastAdmin", message = "#user.username# is the only admin" )
 		}
 		variables.db.execute( "UPDATE users SET role = ? WHERE id = ?", [ arguments.role, arguments.id ] )
@@ -253,7 +305,7 @@ class {
 	/** Throws Users.LastAdmin for the only admin. */
 	void function setDisabled( required numeric id, required boolean disabled ) {
 		var user = get( arguments.id )
-		if ( arguments.disabled && ( user.role ?: "" ) == "admin" && adminCount() <= 1 ) {
+		if ( arguments.disabled && isActiveAdmin( user ) && adminCount() <= 1 ) {
 			throw( type = "Users.LastAdmin", message = "#user.username# is the only admin" )
 		}
 		variables.db.execute(
@@ -268,7 +320,7 @@ class {
 		if ( user.isEmpty() ) {
 			return
 		}
-		if ( user.role == "admin" && adminCount() <= 1 ) {
+		if ( isActiveAdmin( user ) && adminCount() <= 1 ) {
 			throw( type = "Users.LastAdmin", message = "#user.username# is the only admin" )
 		}
 		var used = variables.db.query(
@@ -279,6 +331,11 @@ class {
 			throw( type = "Users.Conflict", message = "#user.username# has posts or uploads; disable the account instead" )
 		}
 		variables.db.execute( "DELETE FROM users WHERE id = ?", [ arguments.id ] )
+	}
+
+	/** An enabled admin: one of those adminCount() counts, which the site mustn't run out of. */
+	private boolean function isActiveAdmin( required struct user ) {
+		return ( arguments.user.role ?: "" ) == "admin" && !len( arguments.user.disabled_at ?: "" )
 	}
 
 	string function initialsOf( required string name ) {

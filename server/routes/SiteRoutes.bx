@@ -30,6 +30,7 @@ class {
 		var bots     = arguments.svc.bots
 		var siteUrl  = arguments.svc.settings.siteUrl
 		var maxPage  = static.MAX_PAGE
+		var searchesPerMinute = arguments.svc.settings.limits.searchesPerMinute ?: 30
 
 		// what every page's layout needs
 		var page = ( req, struct data ) => {
@@ -155,10 +156,17 @@ class {
 			res.render( "site/authors", page( req, { pageTitle: "Authors", authors: users.authorsWithPosts() } ) )
 		} )
 
-		arguments.app.get( "/search", ( req, res ) => {
+		// each search is a full-text query, and an unmatched one a scan of every post
+		var searchLimiter = boxExpressRateLimit( {
+			windowMs : 60 * 1000,
+			max      : searchesPerMinute,
+			message  : "That's a lot of searches. Try again in a minute."
+		} )
+
+		arguments.app.get( "/search", searchLimiter, ( req, res ) => {
 			var q = left( trim( isSimpleValue( req.query.q ?: "" ) ? ( req.query.q ?: "" ) : "" ), 200 )
 			var paging = len( q )
-				? posts.search( q, pageNumber( req ), site.all().postsPerPage )
+				? posts.search( q, pageNumber( req ), site.all().postsPerPage, !bots.isBot( req.get( "User-Agent" ) ?: "" ) )
 				: { posts: [], total: 0, page: 1, pageSize: 10, totalPages: 0 }
 			res.render( "site/search", page( req, {
 				pageTitle : len( q ) ? "Search: #q#" : "Search",

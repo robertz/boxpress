@@ -31,7 +31,25 @@ class {
 
 	/** Whether this session may use the admin powers its account has: it signed in, or confirmed, with a passkey. */
 	boolean function adminAllowed( required struct sessionData ) {
-		return !requiredForAdmins() || ( arguments.sessionData.passkey ?: false ) == true
+		return !requiredForAdmins() || confirmed( arguments.sessionData )
+	}
+
+	/**
+	 * Whether the session was confirmed with a passkey that is still on its
+	 * account. The session keeps that passkey's credential id (sessionData.passkey),
+	 * so removing the passkey, here or by an admin, ends what it confirmed in
+	 * every session at once.
+	 */
+	boolean function confirmed( required struct sessionData ) {
+		var credential = arguments.sessionData.passkey ?: ""
+		var userId = arguments.sessionData.userId ?: ""
+		if ( !isSimpleValue( credential ) || !len( credential ) || !isNumeric( userId ) ) {
+			return false
+		}
+		return variables.db.query(
+			"SELECT COUNT(*) AS n FROM user_passkeys WHERE credential_id = ? AND user_id = ?",
+			[ toString( credential ), userId ]
+		).n > 0
 	}
 
 	/** [ { id, name, createdAt, lastUsedAt } ], the newest first. */
@@ -64,10 +82,13 @@ class {
 		return variables.party.registrationOptions( handleOf( arguments.user ), arguments.sessionData )
 	}
 
-	/** Saves the new passkey from the browser's answer, and answers it as list() does. Throws Passkeys.Invalid. */
+	/**
+	 * Saves the new passkey from the browser's answer: { passkey (as list() shows it), credentialId }.
+	 * Throws Passkeys.Invalid.
+	 */
 	struct function register( required struct user, required struct sessionData, required struct answer ) {
-		variables.party.register( handleOf( arguments.user ), arguments.sessionData, arguments.answer )
-		return list( arguments.user.id ).first()
+		var saved = variables.party.register( handleOf( arguments.user ), arguments.sessionData, arguments.answer )
+		return { passkey: list( arguments.user.id ).first(), credentialId: saved.credentialId }
 	}
 
 	/**
@@ -79,9 +100,10 @@ class {
 		return variables.party.signInOptions( arguments.sessionData, arguments.userId ? toString( arguments.userId ) : "" )
 	}
 
-	/** The user id the passkey belongs to. Throws Passkeys.Invalid for anything that doesn't check out. */
-	numeric function verify( required struct sessionData, required struct answer ) {
-		return val( variables.party.verify( arguments.sessionData, arguments.answer ).userId )
+	/** { userId, credentialId } of the passkey that answered. Throws Passkeys.Invalid for anything that doesn't check out. */
+	struct function verify( required struct sessionData, required struct answer ) {
+		var checked = variables.party.verify( arguments.sessionData, arguments.answer )
+		return { userId: val( checked.userId ), credentialId: checked.credentialId }
 	}
 
 	private struct function handleOf( required struct user ) {

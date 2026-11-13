@@ -17,7 +17,9 @@ if ( len( claimed ) ) {
 	println( claimed )
 }
 if ( svc.users.defaultAdminActive() ) {
-	println( "[security] The default account admin / admin still works. Sign in at /admin and change its password under Account." )
+	println( settings.server.production
+		? "[security] The default account admin / admin can't sign in in production. Give it a password first: boxlang scripts/users.bxs password admin (or set BOXPRESS_ADMIN_* before the first start)"
+		: "[security] The default account admin / admin still works. Sign in at /admin and change its password under Account." )
 }
 if ( svc.users.count() == 0 ) {
 	println( "No accounts yet. Create the first admin with: boxlang scripts/users.bxs add <username> <email> --admin" )

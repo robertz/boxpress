@@ -63,7 +63,8 @@ class {
 
 	/** { days, total, previousTotal, today } over the last 30 days, with the 30 before for comparison. */
 	struct function traffic() {
-		var rows = dailyViews( 60 )
+		// today and the 59 days before: the last 30 of them, and the 30 before those
+		var rows = dailyViews( 59 )
 		var cutoff = max( rows.len() - 30, 0 )
 		var days = []
 		var total = 0
@@ -112,13 +113,19 @@ class {
 		)
 	}
 
-	/** The most-read posts: [ { label, url, count } ]. */
-	array function topPosts( numeric days = 30, numeric limit = 10 ) {
+	/** The most-read public posts: [ { label, url, count } ]. authorId 0 is everyone's. */
+	array function topPosts( numeric days = 30, numeric limit = 10, numeric authorId = 0 ) {
+		var params = [ arguments.days ]
+		if ( arguments.authorId ) {
+			params.append( arguments.authorId )
+		}
 		return variables.db.query(
 			"SELECT p.title AS label, p.slug, SUM( v.views ) AS count FROM post_views_daily v JOIN posts p ON p.id = v.post_id
 			WHERE v.view_date >= DATE_SUB( UTC_DATE(), INTERVAL ? DAY )
+				AND p.status = 'published' AND p.published_at <= UTC_TIMESTAMP()
+				#arguments.authorId ? 'AND p.author_id = ?' : ''#
 			GROUP BY p.id ORDER BY count DESC LIMIT #int( arguments.limit )#",
-			[ arguments.days ],
+			params,
 			{ returnType: "array" }
 		).map( ( r ) => { return { label: r.label, url: "/posts/" & encodeForURL( r.slug ), count: r.count } } )
 	}

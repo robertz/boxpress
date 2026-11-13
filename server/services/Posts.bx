@@ -108,8 +108,9 @@ class {
 	/**
 	 * Full-text search over public posts: { posts, total, page, pageSize, totalPages }.
 	 * Words MySQL won't index (shorter than three letters) fall back to a plain match.
+	 * record: whether the search goes in search_log for Insights (not a bot's).
 	 */
-	struct function search( required string query, numeric page = 1, numeric pageSize = 10 ) {
+	struct function search( required string query, numeric page = 1, numeric pageSize = 10, boolean record = true ) {
 		var q = left( trim( arguments.query ), 200 )
 		if ( !len( q ) ) {
 			return { posts: [], total: 0, page: 1, pageSize: arguments.pageSize, totalPages: 0 }
@@ -126,7 +127,7 @@ class {
 			var like = "%" & q.replace( "\", "\\", "all" ).replace( "%", "\%", "all" ).replace( "_", "\_", "all" ) & "%"
 			found = paged( "#static.PUBLIC# AND ( p.title LIKE ? OR p.excerpt LIKE ? OR p.body LIKE ? )", [ like, like, like ], "p.published_at DESC", arguments.page, arguments.pageSize )
 		}
-		if ( arguments.page == 1 ) {
+		if ( arguments.page == 1 && arguments.record ) {
 			variables.db.execute( "INSERT INTO search_log ( query, result_count ) VALUES ( ?, ? )", [ left( lcase( q ), 255 ), found.total ] )
 		}
 		return found

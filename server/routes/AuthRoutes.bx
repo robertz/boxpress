@@ -13,6 +13,7 @@ class {
 		var passkeys    = arguments.svc.passkeys
 		var site        = arguments.svc.site
 		var maxAttempts = arguments.svc.settings.auth.maxLoginAttempts ?: 10
+		var production  = arguments.svc.settings.server.production ?: false
 		var loginLimiter = boxExpressRateLimit( {
 			windowMs : 15 * 60 * 1000,
 			max      : maxAttempts,
@@ -52,6 +53,10 @@ class {
 			if ( user.isEmpty() ) {
 				ApiError::unauthorized( "Wrong email, username or password" )
 			}
+			// the published default password would let anyone in, and on to adding their own passkey
+			if ( production && users.isDefaultLogin( user, password ) ) {
+				ApiError::forbidden( "The default admin password can't be used in production. Set a new one on the server: boxlang scripts/users.bxs password admin" )
+			}
 			signIn( req, users, user )
 			res.json( { authenticated: true, user: me( users, passkeys, user, passkeys.adminAllowed( req.session ) ), csrfToken: req.session.csrfToken } )
 		} )
@@ -68,19 +73,19 @@ class {
 
 		/** { id, clientDataJSON, authenticatorData, signature }: the browser's answer to the options above. */
 		arguments.router.post( "/auth/passkey/login", loginLimiter, ( req, res ) => {
-			var userId = 0
+			var checked = {}
 			try {
-				userId = passkeys.verify( req.session, Http::body( req ) )
+				checked = passkeys.verify( req.session, Http::body( req ) )
 			} catch ( "Passkeys.Invalid" e ) {
 				ApiError::unauthorized( e.message )
 			}
-			var user = users.get( userId )
+			var user = users.get( checked.userId )
 			// as fromSession would: none while disabled
 			if ( user.isEmpty() || !len( user.password_hash ) || len( user.disabled_at ?: "" ) ) {
 				ApiError::unauthorized( "That account can't sign in" )
 			}
 			signIn( req, users, user )
-			req.session.passkey = true
+			req.session.passkey = checked.credentialId
 			res.json( { authenticated: true, user: me( users, passkeys, user, true ), csrfToken: req.session.csrfToken } )
 		} )
 
@@ -153,7 +158,7 @@ class {
 		// once an account has a passkey, adding or removing one takes a session that used one: a
 		// password alone mustn't be able to swap in its own
 		var requirePasskeySession = ( req ) => {
-			if ( passkeys.count( req.user.id ) && ( req.session.passkey ?: false ) != true ) {
+			if ( passkeys.count( req.user.id ) && !passkeys.confirmed( req.session ) ) {
 				ApiError::passkeyRequired( "Confirm it's you with one of your passkeys first" )
 			}
 		}
@@ -169,8 +174,8 @@ class {
 			requirePasskeySession( req )
 			var added = passkeys.register( users.get( req.user.id ), req.session, Http::body( req ) )
 			// the authenticator just answered for this account
-			req.session.passkey = true
-			res.status( 201 ).json( added )
+			req.session.passkey = added.credentialId
+			res.status( 201 ).json( added.passkey )
 		} )
 
 		arguments.router.delete( "/account/passkeys/:id", ( req, res ) => {
@@ -178,25 +183,22 @@ class {
 			if ( !passkeys.remove( req.user.id, Http::pathId( req.params ) ) ) {
 				ApiError::notFound()
 			}
-			// a session confirmed by a key that's gone isn't confirmed any more
-			if ( !passkeys.count( req.user.id ) ) {
-				structDelete( req.session, "passkey" )
-			}
+			// a session confirmed by that key, this one or another, isn't confirmed any more (Passkeys.confirmed)
 			res.status( 204 ).end()
 		} )
 
 		/** { id, clientDataJSON, authenticatorData, signature }: confirms this session with one of the account's passkeys. */
 		arguments.router.post( "/account/passkeys/confirm", passwordLimiter, ( req, res ) => {
-			var userId = 0
+			var checked = {}
 			try {
-				userId = passkeys.verify( req.session, Http::body( req ) )
+				checked = passkeys.verify( req.session, Http::body( req ) )
 			} catch ( "Passkeys.Invalid" e ) {
 				ApiError::unauthorized( e.message )
 			}
-			if ( userId != req.user.id ) {
+			if ( checked.userId != req.user.id ) {
 				ApiError::unauthorized( "That passkey is for another account" )
 			}
-			req.session.passkey = true
+			req.session.passkey = checked.credentialId
 			res.json( me( users, passkeys, users.get( req.user.id ), true ) )
 		} )
 
@@ -209,12 +211,12 @@ class {
 				ApiError::unauthorized( "Current password is wrong" )
 			}
 			users.setPassword( req.user.id, newPassword )
-			var keepPasskey = ( req.session.passkey ?: false ) == true
+			var keepPasskey = req.session.passkey ?: ""
 			req.regenerateSession()
 			newCsrfToken( req )
 			req.session.authVersion = users.fingerprint( users.get( req.user.id ) )
-			if ( keepPasskey ) {
-				req.session.passkey = true
+			if ( isSimpleValue( keepPasskey ) && len( keepPasskey ) ) {
+				req.session.passkey = keepPasskey
 			}
 			res.json( { csrfToken: req.session.csrfToken } )
 		} )

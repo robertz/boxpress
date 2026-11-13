@@ -19,9 +19,9 @@ class extends="testbox.system.BaseSpec" {
 	}
 
 	private function signedIn( string username = "" ) {
-		var client = new ApiClient( baseUrl )
-		client.login( len( username ) ? username : TestSupport::ADMIN_USER, TestSupport::TEST_PASSWORD )
-		return client
+		var browser = new ApiClient( baseUrl )
+		browser.login( len( username ) ? username : TestSupport::ADMIN_USER, TestSupport::TEST_PASSWORD )
+		return browser
 	}
 
 	function run() {
@@ -34,10 +34,10 @@ class extends="testbox.system.BaseSpec" {
 
 				it( "answers who is signed in, and refuses a wrong password", () => {
 					var anonymous = new ApiClient( baseUrl )
-					var session = anonymous.startSession()
-					expect( session.status ).toBe( 200 )
-					expect( session.json.authenticated ).toBeFalse()
-					expect( session.json.csrfToken ).notToBe( "" )
+					var sessionAnswer = anonymous.startSession()
+					expect( sessionAnswer.status ).toBe( 200 )
+					expect( sessionAnswer.json.authenticated ).toBeFalse()
+					expect( sessionAnswer.json.csrfToken ).notToBe( "" )
 					expect( anonymous.login( TestSupport::ADMIN_USER, "wrong-password" ).status ).toBe( 401 )
 					expect( anonymous.get( "/api/posts" ).status ).toBe( 401 )
 
@@ -240,6 +240,120 @@ class extends="testbox.system.BaseSpec" {
 					expect( answer.json.history ).toBe( [] )
 					svc.history.record()
 					expect( admin.get( "/api/admin/server" ).json.history.len() ).toBe( 1 )
+				} )
+			} )
+
+			describe( "Review fixes", () => {
+
+				it( "refuses the default admin / admin sign-in in production", () => {
+					svc.db.execute( "DELETE FROM users WHERE username = 'admin'" )
+					svc.db.execute(
+						"INSERT INTO users ( username, email, password_hash, role ) VALUES ( 'admin', 'admin@example.com', ?, 'admin' )",
+						[ bcryptHash( "admin" ) ]
+					)
+					var prod = TestSupport::services( { server: { production: true } } )
+					var prodApp = Api::build( prod )
+					prodApp.listen( port = 4933, options = { block: false } )
+					try {
+						var answer = new ApiClient( "http://127.0.0.1:4933" ).login( "admin", "admin" )
+						expect( answer.status ).toBe( 403, answer.body )
+						expect( answer.json.message ).toInclude( "scripts/users.bxs password admin" )
+					} finally {
+						prodApp.close()
+					}
+					// outside production it still signs in, for a first look
+					expect( new ApiClient( baseUrl ).login( "admin", "admin" ).status ).toBe( 200 )
+				} )
+
+				it( "ends a passkey's confirmation in every session once the passkey is removed", () => {
+					var strict = TestSupport::services( { passkeys: { requiredForAdmins: true } } )
+					var userId = TestSupport::userId( svc )
+					svc.db.execute(
+						"INSERT INTO user_passkeys ( user_id, credential_id, public_key, algorithm, name ) VALUES ( ?, 'cred-1', 'key', -7, 'Laptop' )",
+						[ userId ]
+					)
+					var stolen = { userId: userId, passkey: "cred-1" }
+					expect( strict.passkeys.adminAllowed( stolen ) ).toBeTrue()
+					expect( strict.passkeys.adminAllowed( { userId: userId, passkey: true } ) ).toBeFalse()
+					expect( strict.passkeys.adminAllowed( { userId: TestSupport::userId( svc, TestSupport::AUTHOR_USER ), passkey: "cred-1" } ) ).toBeFalse()
+					svc.db.execute( "DELETE FROM user_passkeys WHERE credential_id = 'cred-1'" )
+					expect( strict.passkeys.adminAllowed( stolen ) ).toBeFalse()
+				} )
+
+				it( "shows an author the top posts of their own, public, posts only", () => {
+					var admin = signedIn()
+					var adminPost = admin.post( "/api/posts", { title: "Admin hit", body: "x", status: "published" } ).json
+					var author = signedIn( TestSupport::AUTHOR_USER )
+					var own = author.post( "/api/posts", { title: "Writer hit", body: "y", status: "published" } ).json
+					svc.posts.recordView( adminPost.id )
+					svc.posts.recordView( own.id )
+					expect( author.get( "/api/dashboard/top-posts" ).json.map( ( p ) => p.label ) ).toBe( [ "Writer hit" ] )
+					expect( admin.get( "/api/dashboard/top-posts" ).json.len() ).toBe( 2 )
+					admin.put( "/api/posts/#adminPost.id#", { status: "draft" } )
+					expect( admin.get( "/api/dashboard/top-posts" ).json.map( ( p ) => p.label ) ).toBe( [ "Writer hit" ] )
+				} )
+
+				it( "leaves bots' searches out of the log, and prunes old ones", () => {
+					var reader = new ApiClient( baseUrl )
+					reader.send( "GET", "/search?q=botquery", "", { "User-Agent": "Googlebot/2.1" } )
+					reader.get( "/search?q=personquery" )
+					var logged = svc.db.query( "SELECT query FROM search_log", [], { returnType: "array" } ).map( ( r ) => r.query )
+					expect( logged ).toBe( [ "personquery" ] )
+					svc.db.execute( "UPDATE search_log SET searched_at = DATE_SUB( UTC_TIMESTAMP(), INTERVAL 400 DAY )" )
+					svc.requestLog.prune()
+					expect( svc.db.query( "SELECT COUNT(*) AS n FROM search_log" ).n ).toBe( 0 )
+				} )
+
+				it( "lets an admin delete or demote a disabled admin while one admin is left", () => {
+					var admin = signedIn()
+					var second = admin.post( "/api/admin/users", { username: "second", email: "second@example.test", password: "long-enough-1", role: "admin" } ).json
+					expect( admin.patch( "/api/admin/users/#second.id#", { disabled: true } ).status ).toBe( 200 )
+					expect( admin.patch( "/api/admin/users/#second.id#", { role: "author" } ).status ).toBe( 200 )
+					expect( admin.patch( "/api/admin/users/#second.id#", { role: "admin" } ).status ).toBe( 200 )
+					expect( admin.delete( "/api/admin/users/#second.id#" ).status ).toBe( 204 )
+				} )
+
+				it( "changes nothing when one field of an account edit fails", () => {
+					var admin = signedIn()
+					var writerId = TestSupport::userId( svc, TestSupport::AUTHOR_USER )
+					var answer = admin.patch( "/api/admin/users/#writerId#", { role: "admin", displayName: "Renamed", password: "short" } )
+					expect( answer.status ).toBe( 400 )
+					var writer = svc.users.get( writerId )
+					expect( writer.role ).toBe( "author" )
+					expect( writer.display_name ).toBe( "Test Writer" )
+				} )
+
+				it( "compares the last 30 days of views with the 30 before", () => {
+					for ( var i = 1; i <= 70; i++ ) {
+						svc.db.execute(
+							"INSERT INTO request_log_daily ( log_date, kind, name, hits ) VALUES ( DATE_SUB( UTC_DATE(), INTERVAL ? DAY ), 'pageviews', '', 100 )",
+							[ i ]
+						)
+					}
+					var traffic = signedIn().get( "/api/admin/insights/traffic" ).json
+					expect( traffic.days.len() ).toBe( 30 )
+					// 29 full days and today, which has no views yet
+					expect( traffic.total ).toBe( 2900 )
+					expect( traffic.previousTotal ).toBe( 3000 )
+				} )
+
+				it( "writes every queued request to the access log in one flush", () => {
+					var reader = new ApiClient( baseUrl )
+					for ( var i = 1; i <= 30; i++ ) {
+						reader.get( "/tags" )
+					}
+					var written = svc.requestLog.flush()
+					expect( written ).toBeGTE( 30 )
+					expect( svc.db.query( "SELECT COUNT(*) AS n FROM request_log WHERE path = '/tags'" ).n ).toBe( 30 )
+					expect( svc.requestLog.queued() ).toBe( 0 )
+				} )
+
+				it( "keeps size words that are part of an image caption", () => {
+					var html = svc.markdown.render( '![x](/a.png "caption: A wide river at dusk")' ).html
+					expect( html ).notToInclude( "post-figure--wide" )
+					expect( html ).toInclude( "<figcaption>A wide river at dusk</figcaption>" )
+					expect( svc.markdown.render( '![x](/a.png "half | The logo")' ).html ).toInclude( "post-figure--half" )
+					expect( svc.markdown.render( '![x](/a.png "inline")' ).html ).notToInclude( "<figure" )
 				} )
 			} )
 		} )

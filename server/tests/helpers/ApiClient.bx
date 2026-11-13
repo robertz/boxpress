@@ -8,7 +8,7 @@
 class {
 
 	property name="baseUrl" type="string";
-	property name="client";
+	property name="httpClient";
 	property name="cookies";
 	property name="csrfToken" type="string";
 
@@ -16,7 +16,7 @@ class {
 		variables.baseUrl   = arguments.baseUrl
 		variables.csrfToken = ""
 		variables.cookies   = {}
-		variables.client    = createObject( "java", "java.net.http.HttpClient" ).newHttpClient()
+		variables.httpClient    = createObject( "java", "java.net.http.HttpClient" ).newHttpClient()
 		return this
 	}
 
@@ -103,7 +103,7 @@ class {
 		}
 
 		builder.method( arguments.method, !hasBody ? publishers.noBody() : isBinary( payload ) ? publishers.ofByteArray( payload ) : publishers.ofString( payload ) )
-		var response = variables.client.send( builder.build(), createObject( "java", "java.net.http.HttpResponse$BodyHandlers" ).ofString() )
+		var response = variables.httpClient.send( builder.build(), createObject( "java", "java.net.http.HttpResponse$BodyHandlers" ).ofString() )
 		rememberCookies( response )
 		var text     = response.body() ?: ""
 		var parsed   = {}

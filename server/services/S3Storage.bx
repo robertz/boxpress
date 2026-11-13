@@ -15,7 +15,7 @@ class {
 	property name="accessKeyId" type="string";
 	property name="secretAccessKey" type="string";
 	property name="publicBaseUrl" type="string";
-	property name="client";
+	property name="httpClient";
 
 	/** @settings { endpoint, region, bucket, accessKeyId, secretAccessKey, publicBaseUrl } */
 	function init( required struct settings ) {
@@ -25,7 +25,7 @@ class {
 		variables.accessKeyId     = arguments.settings.accessKeyId ?: ""
 		variables.secretAccessKey = arguments.settings.secretAccessKey ?: ""
 		variables.publicBaseUrl   = reReplace( arguments.settings.publicBaseUrl ?: "", "/+$", "" )
-		variables.client          = createObject( "java", "java.net.http.HttpClient" )
+		variables.httpClient          = createObject( "java", "java.net.http.HttpClient" )
 			.newBuilder()
 			.connectTimeout( createObject( "java", "java.time.Duration" ).ofSeconds( 5 ) )
 			.build()
@@ -115,7 +115,7 @@ class {
 			.GET()
 			.build()
 		try {
-			return variables.client.send( built, createObject( "java", "java.net.http.HttpResponse$BodyHandlers" ).ofByteArray() )
+			return variables.httpClient.send( built, createObject( "java", "java.net.http.HttpResponse$BodyHandlers" ).ofByteArray() )
 		} catch ( any e ) {
 			throw( type: "S3Storage.Error", message: "Couldn't reach the bucket: " & e.message )
 		}
@@ -132,7 +132,7 @@ class {
 		}
 		builder = builder.method( arguments.method, isNull( arguments.body ) ? publishers.noBody() : publishers.ofByteArray( arguments.body ) )
 		try {
-			return variables.client
+			return variables.httpClient
 				.send( builder.build(), createObject( "java", "java.net.http.HttpResponse$BodyHandlers" ).discarding() )
 				.statusCode()
 		} catch ( any e ) {

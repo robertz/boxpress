@@ -6,7 +6,7 @@ import routes.Http;
  * their own posts' figures; an admin, the whole site's.
  *
  *   GET /api/dashboard            post counts, recently changed, upcoming
- *   GET /api/dashboard/top-posts  the most-read posts of the last 30 days
+ *   GET /api/dashboard/top-posts  the most-read public posts of the last 30 days (an author's own)
  */
 class {
 
@@ -35,7 +35,7 @@ class {
 		} )
 
 		arguments.router.get( "/dashboard/top-posts", ( req, res ) => {
-			res.json( insights.topPosts( 30, Http::queryInt( req.query, "limit", 8, 1, 20 ) ) )
+			res.json( insights.topPosts( 30, Http::queryInt( req.query, "limit", 8, 1, 20 ), req.user.isAdmin ? 0 : req.user.id ) )
 		} )
 	}
 
