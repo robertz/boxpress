@@ -1,0 +1,25 @@
+/**
+ * Runs queries against one datasource: a name from .boxlang.json in normal
+ * running, or an inline struct (the tests' boxpress_test database). BoxLang
+ * pools inline datasources by their config, so passing one per call is free.
+ */
+class {
+
+	property name="datasource";
+
+	function init( required datasource ) {
+		variables.datasource = arguments.datasource
+		return this
+	}
+
+	function query( required string sql, any params = {}, struct options = {} ) {
+		return queryExecute( arguments.sql, arguments.params, { datasource: variables.datasource }.append( arguments.options ) )
+	}
+
+	function execute( required string sql, any params = {} ) {
+		var result = {}
+		queryExecute( arguments.sql, arguments.params, { datasource: variables.datasource, result: "result" } )
+		return result
+	}
+
+}

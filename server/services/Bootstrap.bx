@@ -1,0 +1,176 @@
+/**
+ * Loads settings and wires the services together. Shared by server.bxs, the
+ * scripts and the tests so they all build the same object graph.
+ */
+class {
+
+	static {
+		ROOT = expandPath( getDirectoryFromPath( getCurrentTemplatePath() ) & ".." )
+	}
+
+	/**
+	 * Settings come from environment variables; locally, BoxLang reads
+	 * server/.env when started from server/, and the database connection
+	 * itself lives in .boxlang.json. See .env.example for every variable.
+	 * `overrides` is deep-merged on top (tests use it to point at the test database).
+	 */
+	static struct function loadSettings( struct overrides = {} ) {
+		var environment = lcase( setting( "ENV", "development" ) )
+		var production  = environment == "production"
+		var siteUrl     = reReplace( setting( "SITE_URL", "http://localhost:8080" ), "/+$", "" )
+		var siteHost    = lcase( reReplace( siteUrl, "^[a-zA-Z]+://([^/:]+).*$", "\1" ) )
+		var settings = {
+			datasource : "boxpress",
+			siteName   : setting( "SITE_NAME", "BoxPress" ),
+			siteUrl    : siteUrl,
+			siteHost   : siteHost,
+			server     : {
+				port        : int( setting( "PORT", 8080 ) ),
+				environment : environment,
+				production  : production,
+				requestLog  : flag( "REQUEST_LOG", true ),
+				// the built admin and site assets (web/dist); defaults to ../web/dist
+				webRoot     : setting( "WEB_ROOT", "" ),
+				// the header a proxy in front sets to the client's address (CF-Connecting-IP, X-Real-IP);
+				// only safe when nothing can reach the app except through that proxy
+				trustProxyHeader : setting( "TRUST_PROXY_HEADER", "" ),
+				// redirect any other host to SITE_URL's (production only)
+				canonicalHost : flag( "CANONICAL_HOST_REDIRECT", false )
+			},
+			auth : {
+				// bootstrap only: creates the first admin on an empty database
+				username         : setting( "BOXPRESS_ADMIN_USERNAME", "" ),
+				passwordHash     : setting( "BOXPRESS_ADMIN_PASSWORD_HASH", "" ),
+				email            : setting( "BOXPRESS_ADMIN_EMAIL", "" ),
+				sessionDays      : int( setting( "SESSION_DAYS", 30 ) ),
+				maxLoginAttempts : int( setting( "MAX_LOGIN_ATTEMPTS", 10 ) )
+			},
+			// passkeys: rpId is the site's domain, which a passkey is tied to for good
+			passkeys : {
+				rpId              : lcase( setting( "PASSKEY_RP_ID", siteHost ) ),
+				rpName            : setting( "SITE_NAME", "BoxPress" ),
+				origins           : production ? [ siteUrl ] : [],
+				// an admin's powers need a session that signed in, or confirmed, with a passkey
+				requiredForAdmins : flag( "ADMIN_PASSKEY_REQUIRED", production )
+			},
+			// uploaded images (Media)
+			uploads : {
+				maxBytes : int( setting( "UPLOAD_MAX_MB", 10 ) ) * 1048576,
+				prefix   : setting( "UPLOAD_PREFIX", "media" ),
+				perHour  : int( setting( "UPLOADS_PER_HOUR", 200 ) )
+			},
+			// an S3-compatible bucket (R2, AWS S3, MinIO); without all of these, files go to server/uploads
+			s3 : {
+				endpoint        : setting( "S3_ENDPOINT", "" ),
+				region          : setting( "S3_REGION", "auto" ),
+				bucket          : setting( "S3_BUCKET", "" ),
+				accessKeyId     : setting( "S3_ACCESS_KEY_ID", "" ),
+				secretAccessKey : setting( "S3_SECRET_ACCESS_KEY", "" ),
+				publicBaseUrl   : setting( "S3_PUBLIC_BASE_URL", "" )
+			},
+			uploadsDirectory : setting( "UPLOADS_DIR", static.ROOT & "/uploads" ),
+			insights : {
+				keepDays : int( setting( "REQUEST_LOG_DAYS", 90 ) )
+			}
+		}
+		for ( var section in arguments.overrides ) {
+			if ( isStruct( settings[ section ] ?: "" ) && isStruct( arguments.overrides[ section ] ) ) {
+				settings[ section ].append( arguments.overrides[ section ] )
+			} else {
+				settings[ section ] = arguments.overrides[ section ]
+			}
+		}
+		return settings
+	}
+
+	private static string function setting( required string name, defaultValue = "" ) {
+		var value = trim( getSystemSetting( arguments.name, "" ) )
+		return len( value ) ? value : arguments.defaultValue
+	}
+
+	/** "true"/"1" and "false"/"0" exactly; anything else is the default. */
+	private static boolean function flag( required string name, required boolean defaultValue ) {
+		var value = lcase( setting( arguments.name, "" ) )
+		if ( compare( value, "true" ) == 0 || compare( value, "1" ) == 0 ) {
+			return true
+		}
+		if ( compare( value, "false" ) == 0 || compare( value, "0" ) == 0 ) {
+			return false
+		}
+		return arguments.defaultValue
+	}
+
+	/**
+	 * Development, production and the tests each have their own schema
+	 * (boxpress_development, boxpress, boxpress_test). In production the
+	 * schema must be named outright, never .boxlang.json's development
+	 * default, and never another environment's.
+	 */
+	static void function requireOwnSchema( required struct settings ) {
+		if ( !( arguments.settings.server.production ?: false ) || !isSimpleValue( arguments.settings.datasource ) ) {
+			return
+		}
+		var schema = lcase( trim( setting( "BOXPRESS_DB_NAME", "" ) ) )
+		if ( !len( schema ) ) {
+			throw( type = "Bootstrap.Schema", message = "Set BOXPRESS_DB_NAME: in production the schema isn't defaulted" )
+		}
+		if ( reFind( "_(development|test)$", schema ) ) {
+			throw( type = "Bootstrap.Schema", message = "BOXPRESS_DB_NAME is #schema#, another environment's schema; production needs its own" )
+		}
+	}
+
+	/**
+	 * The services. parts may supply some ready-made (the tests' storage), in
+	 * place of what the settings would build.
+	 */
+	static struct function build( required struct settings, struct parts = {} ) {
+		requireOwnSchema( arguments.settings )
+		var javaLib    = new JavaLib( static.ROOT & "/lib" )
+		var db         = new Db( arguments.settings.datasource )
+		var sanitizer  = new Sanitizer( javaLib )
+		var markdown   = new Markdown( sanitizer )
+		var storage    = arguments.parts.storage ?: storageFor( arguments.settings )
+		var users      = new Users( db )
+		var tags       = new Tags( db )
+		var revisions  = new Revisions( db )
+		var posts      = new Posts( db, markdown, tags, revisions, users, arguments.settings.siteHost )
+		var site       = new SiteSettings( db, { title: arguments.settings.siteName } )
+		var bots       = new BotDetector()
+		var routeStats = new RouteStats()
+		var monitor    = new ServerMonitor( db, new GcCauses(), routeStats )
+
+		return {
+			settings     : arguments.settings,
+			db           : db,
+			migrator     : new Migrator( db, static.ROOT & "/migrations" ),
+			sessions     : new SessionStore( db ),
+			sanitizer    : sanitizer,
+			markdown     : markdown,
+			users        : users,
+			passkeys     : new Passkeys( db, arguments.settings.passkeys ),
+			tags         : tags,
+			revisions    : revisions,
+			posts        : posts,
+			site         : site,
+			storage      : storage,
+			media        : new Media( db, storage, arguments.settings.uploads ),
+			feeds        : new Feeds( posts, tags, users, site, arguments.settings.siteUrl ),
+			bots         : bots,
+			requestLog   : new RequestLog( db, bots, arguments.settings.insights.keepDays ),
+			insights     : new Insights( db, arguments.settings.siteHost ),
+			routeStats   : routeStats,
+			monitor      : monitor,
+			history      : new ServerHistory( db, monitor )
+		}
+	}
+
+	/** S3 once every setting is there; until then files on local disk, served at /uploads on the app's own address. */
+	private static function storageFor( required struct settings ) {
+		var s3 = new S3Storage( arguments.settings.s3 )
+		if ( s3.isConfigured() ) {
+			return s3
+		}
+		return new LocalStorage( arguments.settings.uploadsDirectory, "/uploads" )
+	}
+
+}

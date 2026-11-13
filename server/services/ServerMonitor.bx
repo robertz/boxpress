@@ -1,0 +1,402 @@
+/**
+ * The running server, for the admin page's Server tab (GET /api/admin/server):
+ * the JVM's memory, CPU, collectors and threads (java.lang.management), the
+ * container's disk, BoxExpress's HTTP counters, requests by route, the
+ * database pool and MySQL. Read fresh on every
+ * call; they're all local.
+ *
+ * A few readings are HotSpot or Undertow extras rather than standard: each
+ * is read on its own, and one that isn't there is left null rather than
+ * failing the rest.
+ *
+ * Memory and CPU are the container's as the JVM sees them: physical memory
+ * is the container's limit, not the host's. CPU load is worked out from the
+ * process's CPU time, which containers report reliably where the JVM's own
+ * load readings often come back 0.
+ */
+class {
+
+	property name="db";
+	// the BoxExpress app, once server.bxs has built it (attach); null in scripts and tests
+	property name="app";
+	// { cpu, wall } nanoseconds at the previous reading, for recentLoad
+	property name="lastCpu";
+	// { wall, cpu: { thread id: nanoseconds } } at the previous reading, for the busiest threads
+	property name="lastThreads";
+	// the previous MySQL buffer pool counters, for a hit rate since then
+	property name="lastPool";
+	property name="gcCauses";
+	property name="routeStats";
+
+	static {
+		BUSIEST_THREADS = 5
+	}
+
+	function init( required db, required gcCauses, required routeStats ) {
+		variables.db         = arguments.db
+		variables.gcCauses   = arguments.gcCauses
+		variables.routeStats = arguments.routeStats
+		return this
+	}
+
+	void function attach( required app ) {
+		variables.app = arguments.app
+	}
+
+	struct function snapshot() {
+		var mgmt = createObject( "java", "java.lang.management.ManagementFactory" )
+		return {
+			boxlangVersion : server.boxlang.version ?: "",
+			memory         : memoryReading( mgmt ),
+			cpu            : cpuReading( mgmt ),
+			disk           : diskReading(),
+			jvm            : jvmReading( mgmt ),
+			collectors     : collectorsReading( mgmt ),
+			fullGcCauses   : variables.gcCauses.current(),
+			threads        : threadsReading( mgmt ),
+			files          : filesReading( mgmt ),
+			http           : httpReading(),
+			routes         : variables.routeStats.current(),
+			database       : databaseReading(),
+			mysql          : mysqlReading()
+		}
+	}
+
+	private struct function memoryReading( required mgmt ) {
+		var bean    = arguments.mgmt.getMemoryMXBean()
+		var heap    = bean.getHeapMemoryUsage()
+		var nonHeap = bean.getNonHeapMemoryUsage()
+		var pools   = heapPools( arguments.mgmt )
+		var old     = pools.filter( ( p ) => reFindNoCase( "old|tenured", p.name ) > 0 )
+		return {
+			heapUsed          : heap.getUsed(),
+			heapCommitted     : heap.getCommitted(),
+			heapMax           : heap.getMax(),
+			nonHeapUsed       : nonHeap.getUsed(),
+			nonHeapCommitted  : nonHeap.getCommitted(),
+			oldGenAfterLastGc : old.len() ? old[ 1 ].usedAfterLastGc : javaCast( "null", "" ),
+			pools             : pools,
+			direct            : directReading( arguments.mgmt )
+		}
+	}
+
+	/**
+	 * NIO's direct buffers (Undertow's among them), off the heap and capped by
+	 * -XX:MaxDirectMemorySize. Near the cap, allocating one calls System.gc() so
+	 * the unreachable ones are freed: a full collection however empty the old
+	 * generation is. Null when the JVM has no "direct" pool.
+	 */
+	private function directReading( required mgmt ) {
+		var classes = createObject( "java", "java.lang.Class" )
+		for ( var pool in arguments.mgmt.getPlatformMXBeans( classes.forName( "java.lang.management.BufferPoolMXBean" ) ) ) {
+			if ( pool.getName() == "direct" ) {
+				return { buffers: pool.getCount(), used: pool.getMemoryUsed(), capacity: pool.getTotalCapacity(), max: directMax( arguments.mgmt ) }
+			}
+		}
+		return javaCast( "null", "" )
+	}
+
+	/** The cap on direct buffers: -XX:MaxDirectMemorySize, or the heap's cap when that's unset (0). Null off HotSpot. */
+	private function directMax( required mgmt ) {
+		var source = arguments.mgmt
+		var option = optional( () => source.getPlatformMXBean( createObject( "java", "java.lang.Class" ).forName( "com.sun.management.HotSpotDiagnosticMXBean" ) ).getVMOption( "MaxDirectMemorySize" ).getValue() )
+		if ( isNull( option ) ) {
+			return javaCast( "null", "" )
+		}
+		return val( option ) > 0 ? val( option ) : createObject( "java", "java.lang.Runtime" ).getRuntime().maxMemory()
+	}
+
+	/**
+	 * Each heap area (young, survivor, old), with what it held right after its
+	 * last collection: the old generation's figure is the memory still in use,
+	 * so it rising across full GCs is a leak, and holding steady is not.
+	 */
+	private array function heapPools( required mgmt ) {
+		var heapType = createObject( "java", "java.lang.management.MemoryType" ).HEAP
+		var result   = []
+		for ( var pool in arguments.mgmt.getMemoryPoolMXBeans() ) {
+			if ( pool.getType() != heapType ) {
+				continue
+			}
+			var usage = pool.getUsage()
+			var after = pool.getCollectionUsage()
+			result.append( {
+				name            : pool.getName(),
+				used            : usage.getUsed(),
+				committed       : usage.getCommitted(),
+				max             : usage.getMax() >= 0 ? usage.getMax() : javaCast( "null", "" ),
+				usedAfterLastGc : isNull( after ) ? javaCast( "null", "" ) : after.getUsed()
+			} )
+		}
+		return result
+	}
+
+	private struct function cpuReading( required mgmt ) {
+		var os         = arguments.mgmt.getOperatingSystemMXBean()
+		var processors = os.getAvailableProcessors()
+		var result     = {
+			processors          : processors,
+			// com.sun.management.OperatingSystemMXBean, HotSpot's
+			physicalMemoryTotal : optional( () => os.getTotalMemorySize() ),
+			physicalMemoryFree  : optional( () => os.getFreeMemorySize() )
+		}
+		var cpuNanos = optional( () => os.getProcessCpuTime() )
+		if ( isNull( cpuNanos ) || cpuNanos < 0 ) {
+			return result
+		}
+		var wallNanos   = createObject( "java", "java.lang.System" ).nanoTime()
+		var uptimeNanos = arguments.mgmt.getRuntimeMXBean().getUptime() * 1000000
+		result.processCpuSeconds = cpuNanos / 1000000000
+		if ( uptimeNanos > 0 ) {
+			result.averageLoad = min( cpuNanos / ( uptimeNanos * processors ), 1 )
+		}
+		if ( !isNull( variables.lastCpu ) && wallNanos > variables.lastCpu.wall ) {
+			var elapsed = wallNanos - variables.lastCpu.wall
+			result.recentLoad    = min( max( cpuNanos - variables.lastCpu.cpu, 0 ) / ( elapsed * processors ), 1 )
+			result.recentSeconds = int( elapsed / 1000000000 )
+		}
+		variables.lastCpu = { cpu: cpuNanos, wall: wallNanos }
+		return result
+	}
+
+	private struct function diskReading() {
+		var root = createObject( "java", "java.io.File" ).init( "/" )
+		return { total: root.getTotalSpace(), free: root.getFreeSpace(), usable: root.getUsableSpace() }
+	}
+
+	private struct function jvmReading( required mgmt ) {
+		var runtime = arguments.mgmt.getRuntimeMXBean()
+		var started = createObject( "java", "java.time.Instant" ).ofEpochMilli( runtime.getStartTime() )
+		return {
+			vmName        : runtime.getVmName(),
+			javaVersion   : createObject( "java", "java.lang.System" ).getProperty( "java.version" ),
+			startedAt     : started.toString(),
+			uptimeSeconds : int( runtime.getUptime() / 1000 ),
+			loadedClasses : arguments.mgmt.getClassLoadingMXBean().getLoadedClassCount(),
+			// -D values hidden: system properties are where a secret would be passed
+			jvmArguments  : arrayNew( 1 ).append( runtime.getInputArguments().toArray(), true ).map( ( flag ) => reReplace( flag, "^(-D[^=]+)=.*$", "\1=(hidden)" ) )
+		}
+	}
+
+	private array function collectorsReading( required mgmt ) {
+		var result = []
+		for ( var bean in arguments.mgmt.getGarbageCollectorMXBeans() ) {
+			result.append( { name: bean.getName(), collections: bean.getCollectionCount(), timeMs: bean.getCollectionTime() } )
+		}
+		return result
+	}
+
+	private struct function threadsReading( required mgmt ) {
+		var bean = arguments.mgmt.getThreadMXBean()
+		return {
+			live       : bean.getThreadCount(),
+			peak       : bean.getPeakThreadCount(),
+			daemon     : bean.getDaemonThreadCount(),
+			started    : bean.getTotalStartedThreadCount(),
+			deadlocked : deadlockedThreads( bean ),
+			busiest    : busiestThreads( bean )
+		}
+	}
+
+	/** The names of threads stuck waiting on each other's locks; empty normally. */
+	private array function deadlockedThreads( required bean ) {
+		var ids = arguments.bean.findDeadlockedThreads()
+		if ( isNull( ids ) ) {
+			return []
+		}
+		var names = []
+		for ( var info in arguments.bean.getThreadInfo( ids ) ) {
+			if ( !isNull( info ) ) {
+				names.append( info.getThreadName() )
+			}
+		}
+		return names
+	}
+
+	/**
+	 * The threads that used the most CPU since the previous reading, or since
+	 * they started on the first one (recentLoad null): a stuck loop shows as
+	 * one thread near 1.
+	 */
+	private array function busiestThreads( required bean ) {
+		if ( !arguments.bean.isThreadCpuTimeSupported() || !arguments.bean.isThreadCpuTimeEnabled() ) {
+			return []
+		}
+		var wall    = createObject( "java", "java.lang.System" ).nanoTime()
+		var before  = variables.lastThreads ?: {}
+		var elapsed = before.isEmpty() ? 0 : wall - before.wall
+		var cpu     = {}
+		var result  = []
+		for ( var info in arguments.bean.getThreadInfo( arguments.bean.getAllThreadIds() ) ) {
+			if ( isNull( info ) ) {
+				continue
+			}
+			var id    = toString( info.getThreadId() )
+			var nanos = arguments.bean.getThreadCpuTime( info.getThreadId() )
+			if ( nanos < 0 ) {
+				continue
+			}
+			cpu[ id ] = nanos
+			var used = elapsed > 0 ? max( nanos - ( before.cpu[ id ] ?: 0 ), 0 ) : nanos
+			result.append( {
+				name       : info.getThreadName(),
+				state      : info.getThreadState().toString(),
+				cpuSeconds : nanos / 1000000000,
+				recentLoad : elapsed > 0 ? min( used / elapsed, 1 ) : javaCast( "null", "" ),
+				used       : used
+			} )
+		}
+		variables.lastThreads = { wall: wall, cpu: cpu }
+		if ( result.isEmpty() ) {
+			return result
+		}
+		return result.sort( ( a, b ) => sgn( b.used - a.used ) )
+			.slice( 1, min( static.BUSIEST_THREADS, result.len() ) )
+			.map( ( t ) => t.filter( ( key ) => key != "used" ) )
+	}
+
+	/** Open file descriptors (sockets included) against the process's limit; null off Unix. */
+	private function filesReading( required mgmt ) {
+		var os   = arguments.mgmt.getOperatingSystemMXBean()
+		var open = optional( () => os.getOpenFileDescriptorCount() )
+		return isNull( open ) ? javaCast( "null", "" ) : { open: open, max: optional( () => os.getMaxFileDescriptorCount() ) }
+	}
+
+	/** Undertow's counters since the server started; null before attach, or while it isn't listening (the record taken at start). */
+	private function httpReading() {
+		if ( isNull( variables.app ) ) {
+			return javaCast( "null", "" )
+		}
+		var app = variables.app
+		var stats = optional( () => app.getConnectorStatistics() )
+		if ( isNull( stats ) ) {
+			return javaCast( "null", "" )
+		}
+		return {
+			requests             : stats.getRequestCount(),
+			errors               : stats.getErrorCount(),
+			activeRequests       : stats.getActiveRequests(),
+			maxActiveRequests    : stats.getMaxActiveRequests(),
+			activeConnections    : stats.getActiveConnections(),
+			maxActiveConnections : stats.getMaxActiveConnections(),
+			bytesSent            : stats.getBytesSent(),
+			bytesReceived        : stats.getBytesReceived()
+		}
+	}
+
+	/**
+	 * The database server as MySQL reports it: how much of the data fits in its
+	 * buffer pool and how often a read had to go to disk (since MySQL started, and
+	 * since the previous reading), connections, slow queries and the largest tables.
+	 * Null when the server won't say (no privilege, or not MySQL).
+	 */
+	private function mysqlReading() {
+		try {
+			var values = {}
+			for ( var row in variables.db.query(
+				"SHOW GLOBAL VARIABLES WHERE Variable_name IN ( 'version', 'innodb_buffer_pool_size', 'max_connections', 'long_query_time' )",
+				[], { returnType: "array" }
+			) ) {
+				values[ row.Variable_name ] = row.Value
+			}
+			for ( var row in variables.db.query(
+				"SHOW GLOBAL STATUS WHERE Variable_name IN ( 'Uptime', 'Threads_connected', 'Threads_running', 'Slow_queries', 'Questions',
+					'Innodb_buffer_pool_read_requests', 'Innodb_buffer_pool_reads', 'Innodb_buffer_pool_pages_total',
+					'Innodb_buffer_pool_pages_data', 'Innodb_buffer_pool_pages_free', 'Innodb_buffer_pool_pages_dirty', 'Innodb_page_size',
+					'Created_tmp_tables', 'Created_tmp_disk_tables', 'Sort_merge_passes', 'Innodb_rows_read' )",
+				[], { returnType: "array" }
+			) ) {
+				values[ row.Variable_name ] = row.Value
+			}
+			var requests = val( values.Innodb_buffer_pool_read_requests ?: 0 )
+			var misses   = val( values.Innodb_buffer_pool_reads ?: 0 )
+			var pageSize = val( values.Innodb_page_size ?: 16384 )
+			var result = {
+				version              : values.version ?: "",
+				uptimeSeconds        : val( values.Uptime ?: 0 ),
+				bufferPoolBytes      : val( values.innodb_buffer_pool_size ?: 0 ),
+				bufferPoolDataBytes  : val( values.Innodb_buffer_pool_pages_data ?: 0 ) * pageSize,
+				bufferPoolFreeBytes  : val( values.Innodb_buffer_pool_pages_free ?: 0 ) * pageSize,
+				bufferPoolDirtyBytes : val( values.Innodb_buffer_pool_pages_dirty ?: 0 ) * pageSize,
+				readRequests         : requests,
+				diskReads            : misses,
+				hitRate              : requests ? 1 - misses / requests : javaCast( "null", "" ),
+				rowsRead             : val( values.Innodb_rows_read ?: 0 ),
+				queries              : val( values.Questions ?: 0 ),
+				slowQueries          : val( values.Slow_queries ?: 0 ),
+				longQuerySeconds     : val( values.long_query_time ?: 0 ),
+				threadsConnected     : val( values.Threads_connected ?: 0 ),
+				threadsRunning       : val( values.Threads_running ?: 0 ),
+				maxConnections       : val( values.max_connections ?: 0 ),
+				tmpTables            : val( values.Created_tmp_tables ?: 0 ),
+				tmpDiskTables        : val( values.Created_tmp_disk_tables ?: 0 ),
+				sortMergePasses      : val( values.Sort_merge_passes ?: 0 )
+			}
+			var wallNanos = createObject( "java", "java.lang.System" ).nanoTime()
+			if ( !isNull( variables.lastPool ) && requests >= variables.lastPool.requests && wallNanos > variables.lastPool.wall ) {
+				var recentRequests = requests - variables.lastPool.requests
+				result.recentHitRate     = recentRequests ? 1 - ( misses - variables.lastPool.misses ) / recentRequests : javaCast( "null", "" )
+				result.recentDiskReads   = misses - variables.lastPool.misses
+				result.recentSeconds     = int( ( wallNanos - variables.lastPool.wall ) / 1000000000 )
+			}
+			variables.lastPool = { requests: requests, misses: misses, wall: wallNanos }
+			// information_schema's sizes are estimates, refreshed at most daily (information_schema_stats_expiry)
+			result.tables = variables.db.query(
+				"SELECT table_name AS name, COALESCE( table_rows, 0 ) AS `rows`, data_length AS dataBytes, index_length AS indexBytes
+				FROM information_schema.TABLES WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'
+				ORDER BY data_length + index_length DESC LIMIT 12",
+				[], { returnType: "array" }
+			)
+			return result
+		} catch ( any e ) {
+			return javaCast( "null", "" )
+		}
+	}
+
+	/**
+	 * The named datasource's connection pools, added up: the runtime registers
+	 * each under a name of its own (server_boxpress_1500649575), and can hold more
+	 * than one for the same datasource. Null for an inline datasource (the tests
+	 * pass one) or before the first query.
+	 */
+	private function databaseReading() {
+		var name = variables.db.getDatasource()
+		if ( !isSimpleValue( name ) ) {
+			return javaCast( "null", "" )
+		}
+		var sources = getBoxRuntime().getDataSourceService()
+		var pattern = "_#lcase( name )#_[0-9]+$"
+		var result  = { pools: 0, active: 0, idle: 0, total: 0, waiting: 0, max: 0 }
+		for ( var registered in sources.getNames() ) {
+			if ( !reFind( pattern, lcase( registered ) ) ) {
+				continue
+			}
+			try {
+				var source = sources.get( createObject( "java", "ortus.boxlang.runtime.scopes.Key" ).of( registered ) )
+				// the registration from the config file never pools; the first query registers the one that does
+				if ( !source.isPoolingStarted() ) {
+					continue
+				}
+				var stats = source.getPoolStats()
+				result.pools++
+				result.active  += stats.activeConnections
+				result.idle    += stats.idleConnections
+				result.total   += stats.totalConnections
+				result.waiting += stats.pendingThreads
+				result.max     += stats.maxConnections
+			} catch ( any e ) {
+				// one not pooling yet
+			}
+		}
+		return result.pools ? result : javaCast( "null", "" )
+	}
+
+	private function optional( required reading ) {
+		try {
+			return arguments.reading()
+		} catch ( any e ) {
+			return javaCast( "null", "" )
+		}
+	}
+
+}

@@ -1,0 +1,269 @@
+import services.ApiError;
+import routes.Http;
+
+/**
+ * Signing in and out (by password or passkey), and the signed-in account's
+ * own settings: profile, password and passkeys. There is no sign-up: an
+ * admin adds authors under Admin > Authors.
+ */
+class {
+
+	static void function register( required router, required struct svc ) {
+		var users       = arguments.svc.users
+		var passkeys    = arguments.svc.passkeys
+		var site        = arguments.svc.site
+		var maxAttempts = arguments.svc.settings.auth.maxLoginAttempts ?: 10
+		var loginLimiter = boxExpressRateLimit( {
+			windowMs : 15 * 60 * 1000,
+			max      : maxAttempts,
+			message  : "Too many sign-in attempts. Try again in a few minutes."
+		} )
+		// guesses spread over many addresses still count against the account
+		var accountLimiter = boxExpressRateLimit( {
+			windowMs     : 15 * 60 * 1000,
+			max          : maxAttempts,
+			message      : "Too many sign-in attempts. Try again in a few minutes.",
+			keyGenerator : ( req ) => {
+				var name = isStruct( req.body ) ? ( req.body.username ?: "" ) : ""
+				var typed = lcase( trim( isSimpleValue( name ) ? name : "" ) )
+				var account = users.findForLogin( typed )
+				return account.isEmpty() ? "login:" & typed : "login:##" & account.id
+			}
+		} )
+
+		/** The admin app calls this first: who is signed in, the site's name, and the CSRF token. */
+		arguments.router.get( "/auth/session", ( req, res ) => {
+			var user = users.fromSession( req.session )
+			res.json( {
+				authenticated : !user.isEmpty(),
+				user          : user.isEmpty() ? javacast( "null", "" ) : me( users, passkeys, user, passkeys.adminAllowed( req.session ) ),
+				siteName      : site.all().title,
+				passkeysForAdmins : passkeys.requiredForAdmins(),
+				csrfToken     : req.csrfToken()
+			} )
+		} )
+
+		/** { username, password }: `username` may be the account's username or its email. */
+		arguments.router.post( "/auth/login", loginLimiter, accountLimiter, ( req, res ) => {
+			var payload  = Http::body( req )
+			var username = isSimpleValue( payload.username ?: "" ) ? ( payload.username ?: "" ) : ""
+			var password = isSimpleValue( payload.password ?: "" ) ? ( payload.password ?: "" ) : ""
+			var user     = users.verify( username, password )
+			if ( user.isEmpty() ) {
+				ApiError::unauthorized( "Wrong email, username or password" )
+			}
+			signIn( req, users, user )
+			res.json( { authenticated: true, user: me( users, passkeys, user, passkeys.adminAllowed( req.session ) ), csrfToken: req.session.csrfToken } )
+		} )
+
+		/**
+		 * The challenge for signing in with a passkey, or with { confirm: true }
+		 * for confirming the signed-in account (only its passkeys are offered).
+		 */
+		arguments.router.post( "/auth/passkey/options", loginLimiter, ( req, res ) => {
+			var payload = Http::body( req )
+			var user = ( payload.confirm ?: false ) == true ? users.fromSession( req.session ) : {}
+			res.json( passkeys.signInOptions( req.session, user.isEmpty() ? 0 : user.id ) )
+		} )
+
+		/** { id, clientDataJSON, authenticatorData, signature }: the browser's answer to the options above. */
+		arguments.router.post( "/auth/passkey/login", loginLimiter, ( req, res ) => {
+			var userId = 0
+			try {
+				userId = passkeys.verify( req.session, Http::body( req ) )
+			} catch ( "Passkeys.Invalid" e ) {
+				ApiError::unauthorized( e.message )
+			}
+			var user = users.get( userId )
+			// as fromSession would: none while disabled
+			if ( user.isEmpty() || !len( user.password_hash ) || len( user.disabled_at ?: "" ) ) {
+				ApiError::unauthorized( "That account can't sign in" )
+			}
+			signIn( req, users, user )
+			req.session.passkey = true
+			res.json( { authenticated: true, user: me( users, passkeys, user, true ), csrfToken: req.session.csrfToken } )
+		} )
+
+		arguments.router.post( "/auth/logout", ( req, res ) => {
+			req.destroySession()
+			res.status( 204 ).end()
+		} )
+	}
+
+	/**
+	 * Loads the signed-in user onto req.user ({ id, username, role, isAdmin, adminRole })
+	 * or answers 401. A session stops counting once its user's password or
+	 * role changes, or the account is disabled or deleted. isAdmin is the
+	 * admin's powers, which may need a passkey-confirmed session
+	 * (Passkeys.adminAllowed); adminRole is the account's role alone.
+	 */
+	static function requireLogin( required users, required passkeys ) {
+		var accounts = arguments.users
+		var keys = arguments.passkeys
+		return ( req, res, next ) => {
+			var user = accounts.fromSession( req.session )
+			if ( user.isEmpty() ) {
+				ApiError::unauthorized()
+			}
+			var adminRole = user.role == "admin"
+			req.user = { id: user.id, username: user.username, role: user.role, isAdmin: adminRole && keys.adminAllowed( req.session ), adminRole: adminRole }
+			next()
+		}
+	}
+
+	static function requireAdmin() {
+		return ( req, res, next ) => {
+			if ( !( req.user.isAdmin ?: false ) ) {
+				if ( req.user.adminRole ?: false ) {
+					ApiError::passkeyRequired()
+				}
+				ApiError::forbidden()
+			}
+			next()
+		}
+	}
+
+	/** Signed-in routes for the account itself. */
+	static void function registerAccount( required router, required struct svc ) {
+		var users    = arguments.svc.users
+		var passkeys = arguments.svc.passkeys
+		// a stolen session cookie mustn't be able to guess its way to the password
+		var passwordLimiter = boxExpressRateLimit( {
+			windowMs     : 15 * 60 * 1000,
+			max          : arguments.svc.settings.auth.maxLoginAttempts ?: 10,
+			message      : "Too many attempts. Try again in a few minutes.",
+			keyGenerator : ( req ) => "password:" & req.user.id
+		} )
+
+		arguments.router.get( "/account", ( req, res ) => {
+			res.json( me( users, passkeys, users.get( req.user.id ), passkeys.adminAllowed( req.session ) ) )
+		} )
+
+		/** { displayName?, bio?, avatarUrl?, website?, email? }. Answers the account. */
+		arguments.router.patch( "/account", ( req, res ) => {
+			users.updateProfile( req.user.id, Http::body( req ) )
+			res.json( me( users, passkeys, users.get( req.user.id ), passkeys.adminAllowed( req.session ) ) )
+		} )
+
+		/** [ { id, name, createdAt, lastUsedAt } ], the newest first. */
+		arguments.router.get( "/account/passkeys", ( req, res ) => {
+			res.json( passkeys.list( req.user.id ) )
+		} )
+
+		// once an account has a passkey, adding or removing one takes a session that used one: a
+		// password alone mustn't be able to swap in its own
+		var requirePasskeySession = ( req ) => {
+			if ( passkeys.count( req.user.id ) && ( req.session.passkey ?: false ) != true ) {
+				ApiError::passkeyRequired( "Confirm it's you with one of your passkeys first" )
+			}
+		}
+
+		/** The options for navigator.credentials.create(). */
+		arguments.router.post( "/account/passkeys/options", ( req, res ) => {
+			requirePasskeySession( req )
+			res.json( passkeys.registrationOptions( users.get( req.user.id ), req.session ) )
+		} )
+
+		/** { id, clientDataJSON, attestationObject, publicKey?, publicKeyAlgorithm?, transports?, name? }: saves the new passkey. */
+		arguments.router.post( "/account/passkeys", passwordLimiter, ( req, res ) => {
+			requirePasskeySession( req )
+			var added = passkeys.register( users.get( req.user.id ), req.session, Http::body( req ) )
+			// the authenticator just answered for this account
+			req.session.passkey = true
+			res.status( 201 ).json( added )
+		} )
+
+		arguments.router.delete( "/account/passkeys/:id", ( req, res ) => {
+			requirePasskeySession( req )
+			if ( !passkeys.remove( req.user.id, Http::pathId( req.params ) ) ) {
+				ApiError::notFound()
+			}
+			// a session confirmed by a key that's gone isn't confirmed any more
+			if ( !passkeys.count( req.user.id ) ) {
+				structDelete( req.session, "passkey" )
+			}
+			res.status( 204 ).end()
+		} )
+
+		/** { id, clientDataJSON, authenticatorData, signature }: confirms this session with one of the account's passkeys. */
+		arguments.router.post( "/account/passkeys/confirm", passwordLimiter, ( req, res ) => {
+			var userId = 0
+			try {
+				userId = passkeys.verify( req.session, Http::body( req ) )
+			} catch ( "Passkeys.Invalid" e ) {
+				ApiError::unauthorized( e.message )
+			}
+			if ( userId != req.user.id ) {
+				ApiError::unauthorized( "That passkey is for another account" )
+			}
+			req.session.passkey = true
+			res.json( me( users, passkeys, users.get( req.user.id ), true ) )
+		} )
+
+		/** { currentPassword, newPassword }. Signs out the account's other sessions; this one carries on, with a new CSRF token. */
+		arguments.router.post( "/auth/password", passwordLimiter, ( req, res ) => {
+			var payload     = Http::body( req )
+			var current     = isSimpleValue( payload.currentPassword ?: "" ) ? ( payload.currentPassword ?: "" ) : ""
+			var newPassword = isSimpleValue( payload.newPassword ?: "" ) ? ( payload.newPassword ?: "" ) : ""
+			if ( !users.checkPassword( req.user.id, current ) ) {
+				ApiError::unauthorized( "Current password is wrong" )
+			}
+			users.setPassword( req.user.id, newPassword )
+			var keepPasskey = ( req.session.passkey ?: false ) == true
+			req.regenerateSession()
+			newCsrfToken( req )
+			req.session.authVersion = users.fingerprint( users.get( req.user.id ) )
+			if ( keepPasskey ) {
+				req.session.passkey = true
+			}
+			res.json( { csrfToken: req.session.csrfToken } )
+		} )
+	}
+
+	/**
+	 * The signed-in account as the admin app keeps it. adminAllowed: whether
+	 * this session may use an admin's powers (Passkeys.adminAllowed).
+	 */
+	static struct function me( required users, required passkeys, required struct user, boolean adminAllowed = true ) {
+		var adminRole = arguments.user.role == "admin"
+		return arguments.users.person( arguments.user ).append( {
+			email             : arguments.user.email,
+			role              : arguments.user.role,
+			isAdmin           : adminRole && arguments.adminAllowed,
+			// an admin signed in without a passkey: the admin app asks for one
+			adminNeedsPasskey : adminRole && !arguments.adminAllowed,
+			passkeys          : arguments.passkeys.count( arguments.user.id )
+		} )
+	}
+
+	/** A string field that may be missing or null ("" then); 400 for anything else. */
+	static string function optionalString( required struct payload, required string name ) {
+		if ( !arguments.payload.keyExists( arguments.name ) || isNull( arguments.payload[ arguments.name ] ) ) {
+			return ""
+		}
+		if ( !isSimpleValue( arguments.payload[ arguments.name ] ) ) {
+			ApiError::badRequest( "#arguments.name# must be a string" )
+		}
+		return trim( arguments.payload[ arguments.name ] )
+	}
+
+	/** A fresh session (and CSRF token) for the user, as after signing in. */
+	static void function signIn( required req, required users, required struct user ) {
+		arguments.req.regenerateSession()
+		newCsrfToken( arguments.req )
+		structDelete( arguments.req.session, "passkey" )
+		arguments.req.session.userId      = arguments.user.id
+		arguments.req.session.authVersion = arguments.users.fingerprint( arguments.user )
+		arguments.users.recordLogin( arguments.user.id )
+	}
+
+	/**
+	 * A new session id keeps the session's data, CSRF token included; replace
+	 * it too, or a token learned before signing in would still work after.
+	 */
+	private static void function newCsrfToken( required req ) {
+		var uuid = createObject( "java", "java.util.UUID" )
+		arguments.req.session.csrfToken = ( uuid.randomUUID().toString() & uuid.randomUUID().toString() ).replace( "-", "", "all" )
+	}
+
+}

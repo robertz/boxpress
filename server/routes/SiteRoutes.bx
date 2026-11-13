@@ -1,0 +1,220 @@
+import routes.Http;
+
+/**
+ * The public site, rendered on the server from views/site/*.bxm.
+ *
+ *   /                    the latest posts (?page=)
+ *   /posts/:slug         a post
+ *   /tag/:slug           a tag's posts
+ *   /tags                every tag in use
+ *   /author/:username    an author and their posts
+ *   /authors             everyone who has published
+ *   /search?q=           full-text search
+ *   /theme.css           the accent colour from Admin > Settings
+ *
+ * No session is started here, so a reader leaves nothing behind but a
+ * request log row.
+ */
+class {
+
+	static {
+		MAX_PAGE = 1000
+		MONTHS = [ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" ]
+	}
+
+	static void function register( required app, required struct svc ) {
+		var posts    = arguments.svc.posts
+		var tags     = arguments.svc.tags
+		var users    = arguments.svc.users
+		var site     = arguments.svc.site
+		var bots     = arguments.svc.bots
+		var siteUrl  = arguments.svc.settings.siteUrl
+		var maxPage  = static.MAX_PAGE
+
+		// what every page's layout needs
+		var page = ( req, struct data ) => {
+			var settings = site.all()
+			var canonical = siteUrl & req.path
+			var description = data.description ?: ( len( settings.description ) ? settings.description : settings.tagline )
+			return {
+				site         : settings,
+				siteUrl      : siteUrl,
+				currentPath  : req.path,
+				canonicalUrl : canonical,
+				description  : description,
+				ogType       : "website",
+				ogImage      : SiteRoutes::absoluteUrl( siteUrl, settings.socialImage ),
+				robots       : "index,follow"
+			}.append( data )
+		}
+
+		var pageNumber = ( req ) => {
+			var raw = req.query.page ?: ""
+			return isNumeric( raw ) && raw >= 1 ? min( int( raw ), maxPage ) : 1
+		}
+
+		// past the last page (a stale link): the last real one, rather than an empty page at a misleading address
+		var pastTheEnd = ( req, res, struct paging ) => {
+			if ( paging.totalPages > 0 && paging.page > paging.totalPages ) {
+				res.redirect( paging.totalPages > 1 ? req.path & "?page=" & paging.totalPages : req.path )
+				return true
+			}
+			return false
+		}
+
+		arguments.app.get( "/theme.css", ( req, res ) => {
+			var accent = site.all().accentColor
+			res.set( "Cache-Control", "public, max-age=300" )
+				.type( "text/css" )
+				.send( ":root{--accent:#accent#}" )
+		} )
+
+		arguments.app.get( "/", ( req, res ) => {
+			var settings = site.all()
+			var paging = posts.publicPage( pageNumber( req ), settings.postsPerPage )
+			if ( pastTheEnd( req, res, paging ) ) {
+				return
+			}
+			res.render( "site/index", page( req, {
+				pageTitle : paging.page > 1 ? "Page #paging.page#" : "",
+				paging    : SiteRoutes::labelled( paging ),
+				topTags   : tags.popular( 12 )
+			} ) )
+		} )
+
+		arguments.app.get( "/posts/:slug", ( req, res, next ) => {
+			var post = posts.publicBySlug( left( req.params.slug ?: "", 255 ) )
+			if ( post.isEmpty() ) {
+				return next()
+			}
+			if ( !bots.isBot( req.get( "User-Agent" ) ?: "" ) ) {
+				try {
+					posts.recordView( post.id )
+				} catch ( any e ) {
+					println( "[views] couldn't count a view: #e.message#" )
+				}
+			}
+			res.render( "site/post", page( req, {
+				pageTitle   : post.title,
+				description : post.excerpt,
+				ogType      : "article",
+				ogImage     : len( post.coverImage ) ? SiteRoutes::absoluteUrl( siteUrl, post.coverImage ) : SiteRoutes::absoluteUrl( siteUrl, site.all().socialImage ),
+				post        : SiteRoutes::labelledPost( post ),
+				neighbours  : posts.neighbours( post ),
+				hasCode     : findNoCase( "<pre", post.html ) > 0
+			} ) )
+		} )
+
+		arguments.app.get( "/tag/:slug", ( req, res, next ) => {
+			var tag = tags.bySlug( left( req.params.slug ?: "", 60 ) )
+			if ( tag.isEmpty() ) {
+				return next()
+			}
+			var paging = posts.publicPage( pageNumber( req ), site.all().postsPerPage, { tagId: tag.id } )
+			if ( paging.total == 0 ) {
+				return next()
+			}
+			if ( pastTheEnd( req, res, paging ) ) {
+				return
+			}
+			res.render( "site/tag", page( req, {
+				pageTitle   : tag.name,
+				description : "Posts tagged #tag.name#",
+				tag         : tag,
+				paging      : SiteRoutes::labelled( paging )
+			} ) )
+		} )
+
+		arguments.app.get( "/tags", ( req, res ) => {
+			res.render( "site/tags", page( req, { pageTitle: "Tags", tags: tags.popular() } ) )
+		} )
+
+		arguments.app.get( "/author/:username", ( req, res, next ) => {
+			var account = users.findByUsername( left( req.params.username ?: "", 50 ) )
+			if ( account.isEmpty() ) {
+				return next()
+			}
+			var paging = posts.publicPage( pageNumber( req ), site.all().postsPerPage, { authorId: account.id } )
+			if ( paging.total == 0 ) {
+				return next()
+			}
+			if ( pastTheEnd( req, res, paging ) ) {
+				return
+			}
+			var author = users.person( account )
+			res.render( "site/author", page( req, {
+				pageTitle   : author.displayName,
+				description : len( author.bio ) ? left( author.bio, 300 ) : "Posts by #author.displayName#",
+				ogType      : "profile",
+				author      : author,
+				paging      : SiteRoutes::labelled( paging )
+			} ) )
+		} )
+
+		arguments.app.get( "/authors", ( req, res ) => {
+			res.render( "site/authors", page( req, { pageTitle: "Authors", authors: users.authorsWithPosts() } ) )
+		} )
+
+		arguments.app.get( "/search", ( req, res ) => {
+			var q = left( trim( isSimpleValue( req.query.q ?: "" ) ? ( req.query.q ?: "" ) : "" ), 200 )
+			var paging = len( q )
+				? posts.search( q, pageNumber( req ), site.all().postsPerPage )
+				: { posts: [], total: 0, page: 1, pageSize: 10, totalPages: 0 }
+			res.render( "site/search", page( req, {
+				pageTitle : len( q ) ? "Search: #q#" : "Search",
+				query     : q,
+				paging    : SiteRoutes::labelled( paging ),
+				robots    : "noindex,follow"
+			} ) )
+		} )
+
+		// nothing above matched: the site's 404 page
+		arguments.app.use( ( req, res ) => {
+			res.status( 404 ).render( "site/404", page( req, { pageTitle: "Page not found", robots: "noindex" } ) )
+		} )
+	}
+
+	/**
+	 * The built site stylesheet and script (Vite names them for their content),
+	 * from web/dist/.vite/manifest.json: { css, js }, each "" without a build.
+	 */
+	static struct function assetsOf( required string webRoot ) {
+		var manifestFile = arguments.webRoot & "/.vite/manifest.json"
+		if ( !fileExists( manifestFile ) ) {
+			return { css: "", js: "" }
+		}
+		var manifest = jsonDeserialize( fileRead( manifestFile ) )
+		var entry = manifest[ "src/site/main.ts" ] ?: {}
+		return {
+			css : ( entry.css ?: [] ).len() ? "/" & entry.css[ 1 ] : "",
+			js  : len( entry.file ?: "" ) ? "/" & entry.file : ""
+		}
+	}
+
+	/** A site-relative address made absolute, for sharing cards; "" stays "". */
+	static string function absoluteUrl( required string siteUrl, string address = "" ) {
+		if ( !len( arguments.address ) || reFindNoCase( "^https?://", arguments.address ) ) {
+			return arguments.address
+		}
+		return arguments.siteUrl & ( left( arguments.address, 1 ) == "/" ? "" : "/" ) & arguments.address
+	}
+
+	/** "November 13, 2026" from an ISO 8601 UTC instant. */
+	static string function dateLabel( string iso = "" ) {
+		if ( !reFind( "^\d{4}-\d{2}-\d{2}", arguments.iso ) ) {
+			return ""
+		}
+		return static.MONTHS[ int( mid( arguments.iso, 6, 2 ) ) ] & " " & int( mid( arguments.iso, 9, 2 ) ) & ", " & left( arguments.iso, 4 )
+	}
+
+	static struct function labelled( required struct paging ) {
+		arguments.paging.posts = arguments.paging.posts.map( ( p ) => SiteRoutes::labelledPost( p ) )
+		return arguments.paging
+	}
+
+	static struct function labelledPost( required struct post ) {
+		arguments.post.dateLabel = SiteRoutes::dateLabel( arguments.post.publishedAt )
+		return arguments.post
+	}
+
+}

@@ -1,0 +1,14 @@
+{
+    "name": "boxpress-server",
+    "version": "0.1.0",
+    "private": true,
+    "devDependencies": {
+        "testbox": "^7.2.0"
+    },
+    "installPaths": {
+        "testbox": "testbox/"
+    },
+    "scripts": {
+        "test": "!boxlang run-tests.bxs"
+    }
+}

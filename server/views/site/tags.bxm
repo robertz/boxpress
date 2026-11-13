@@ -1,0 +1,18 @@
+<bx:include template="_head.bxm">
+<bx:output>
+<div class="wrap">
+	<header class="page-header">
+		<h1 class="page-header__title">Tags</h1>
+	</header>
+	<bx:if data.tags.len()>
+	<p class="tag-cloud">
+		<bx:loop array="#data.tags#" item="tag">
+			<a href="/tag/#encodeForURL( tag.slug )#" class="tag-pill">#encodeForHTML( tag.name )# <span>#tag.posts#</span></a>
+		</bx:loop>
+	</p>
+	<bx:else>
+	<p class="empty">No tags yet.</p>
+	</bx:if>
+</div>
+</bx:output>
+<bx:include template="_foot.bxm">

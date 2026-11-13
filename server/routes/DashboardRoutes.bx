@@ -1,0 +1,42 @@
+import routes.Http;
+
+/**
+ * The admin's home page. Each card has its own endpoint, so the page shows at
+ * once and a slow or failing query only affects its own card. An author sees
+ * their own posts' figures; an admin, the whole site's.
+ *
+ *   GET /api/dashboard            post counts, recently changed, upcoming
+ *   GET /api/dashboard/top-posts  the most-read posts of the last 30 days
+ */
+class {
+
+	static void function register( required router, required struct svc ) {
+		var posts    = arguments.svc.posts
+		var insights = arguments.svc.insights
+		var media    = arguments.svc.media
+		var users    = arguments.svc.users
+		var tags     = arguments.svc.tags
+
+		arguments.router.get( "/dashboard", ( req, res ) => {
+			var scope = req.user.isAdmin ? 0 : req.user.id
+			var result = {
+				counts   : posts.counts( scope ),
+				recent   : posts.recentlyChanged( 8, scope ),
+				upcoming : posts.upcoming( 5, scope )
+			}
+			if ( req.user.isAdmin ) {
+				result.site = {
+					authors : users.count(),
+					tags    : tags.all().len(),
+					media   : media.totals()
+				}
+			}
+			res.json( result )
+		} )
+
+		arguments.router.get( "/dashboard/top-posts", ( req, res ) => {
+			res.json( insights.topPosts( 30, Http::queryInt( req.query, "limit", 8, 1, 20 ) ) )
+		} )
+	}
+
+}

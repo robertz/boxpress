@@ -1,0 +1,248 @@
+import tests.helpers.TestSupport;
+import tests.helpers.ApiClient;
+import routes.Api;
+
+/** Signing in, writing and scheduling posts, and what the public site shows of them. */
+class extends="testbox.system.BaseSpec" {
+
+	function beforeAll() {
+		variables.svc     = TestSupport::services()
+		variables.port    = 4931
+		variables.baseUrl = "http://127.0.0.1:#variables.port#"
+		variables.app     = Api::build( variables.svc )
+		variables.svc.monitor.attach( variables.app )
+		variables.app.listen( port = variables.port, options = { block: false } )
+	}
+
+	function afterAll() {
+		variables.app.close()
+	}
+
+	private function signedIn( string username = "" ) {
+		var client = new ApiClient( baseUrl )
+		client.login( len( username ) ? username : TestSupport::ADMIN_USER, TestSupport::TEST_PASSWORD )
+		return client
+	}
+
+	function run() {
+
+		describe( "BoxPress", () => {
+
+			beforeEach( () => TestSupport::resetDatabase( svc ) )
+
+			describe( "Signing in", () => {
+
+				it( "answers who is signed in, and refuses a wrong password", () => {
+					var anonymous = new ApiClient( baseUrl )
+					var session = anonymous.startSession()
+					expect( session.status ).toBe( 200 )
+					expect( session.json.authenticated ).toBeFalse()
+					expect( session.json.csrfToken ).notToBe( "" )
+					expect( anonymous.login( TestSupport::ADMIN_USER, "wrong-password" ).status ).toBe( 401 )
+					expect( anonymous.get( "/api/posts" ).status ).toBe( 401 )
+
+					var admin = signedIn()
+					var me = admin.get( "/api/account" )
+					expect( me.status ).toBe( 200 )
+					expect( me.json.role ).toBe( "admin" )
+					expect( me.json.isAdmin ).toBeTrue()
+				} )
+
+				it( "refuses a write without the CSRF token", () => {
+					var admin = signedIn()
+					expect( admin.post( "/api/posts", { title: "x" }, { "X-CSRF-Token": "" } ).status ).toBe( 403 )
+				} )
+
+				it( "keeps authors out of the admin's pages", () => {
+					var author = signedIn( TestSupport::AUTHOR_USER )
+					for ( var path in [ "/api/admin/users", "/api/admin/settings", "/api/admin/server", "/api/admin/insights/traffic", "/api/admin/requests" ] ) {
+						expect( author.get( path ).status ).toBe( 403, path )
+					}
+				} )
+
+				it( "asks an admin for a passkey when the site requires one", () => {
+					var strict = TestSupport::services( { passkeys: { requiredForAdmins: true } } )
+					var strictApp = Api::build( strict )
+					strictApp.listen( port = 4932, options = { block: false } )
+					try {
+						var admin = new ApiClient( "http://127.0.0.1:4932" )
+						admin.login( TestSupport::ADMIN_USER, TestSupport::TEST_PASSWORD )
+						var answer = admin.get( "/api/admin/users" )
+						expect( answer.status ).toBe( 403 )
+						expect( answer.json.code ).toBe( "passkey_required" )
+						expect( admin.get( "/api/account" ).json.adminNeedsPasskey ).toBeTrue()
+					} finally {
+						strictApp.close()
+					}
+				} )
+			} )
+
+			describe( "Posts", () => {
+
+				it( "renders Markdown safely and builds a slug from the title", () => {
+					var admin = signedIn()
+					var created = admin.post( "/api/posts", {
+						title  : "Hello, World!",
+						body   : "Some **bold** text.#char( 10 )##char( 10 )#<script>alert(1)</script>#char( 10 )##char( 10 )#[out](https://example.com)",
+						tags   : [ "BoxLang", "boxlang", "Web Dev" ],
+						status : "published"
+					} )
+					expect( created.status ).toBe( 201, created.body )
+					expect( created.json.slug ).toBe( "hello-world" )
+					expect( created.json.status ).toBe( "published" )
+					expect( created.json.html ).toInclude( "<strong>bold</strong>" )
+					expect( created.json.html ).notToInclude( "<script" )
+					expect( created.json.html ).toInclude( 'target="_blank"' )
+					expect( created.json.excerpt ).toBe( "Some bold text. out" )
+					expect( created.json.tags.map( ( t ) => t.slug ) ).toBe( [ "boxlang", "web-dev" ] )
+
+					var again = admin.post( "/api/posts", { title: "Hello, World!", body: "dupe" } )
+					expect( again.json.slug ).toBe( "hello-world-2" )
+					expect( again.json.status ).toBe( "draft" )
+				} )
+
+				it( "shows a published post on the site, and not a draft or a scheduled one", () => {
+					var admin = signedIn()
+					admin.post( "/api/posts", { title: "Live post", body: "Live words.", status: "published", tags: [ "News" ] } )
+					admin.post( "/api/posts", { title: "Draft post", body: "Not yet." } )
+					admin.post( "/api/posts", { title: "Later post", body: "Soon.", status: "published", publishedAt: "2099-01-01T00:00:00Z" } )
+
+					var reader = new ApiClient( baseUrl )
+					expect( reader.get( "/posts/live-post" ).status ).toBe( 200 )
+					expect( reader.get( "/posts/draft-post" ).status ).toBe( 404 )
+					expect( reader.get( "/posts/later-post" ).status ).toBe( 404 )
+					var home = reader.get( "/" )
+					expect( home.status ).toBe( 200 )
+					expect( home.body ).toInclude( "Live post" )
+					expect( home.body ).notToInclude( "Draft post" )
+					expect( home.body ).notToInclude( "Later post" )
+					expect( reader.get( "/tag/news" ).status ).toBe( 200 )
+					expect( reader.get( "/tag/nothing" ).status ).toBe( 404 )
+					expect( reader.get( "/author/#TestSupport::ADMIN_USER#" ).body ).toInclude( "Live post" )
+					// a reader leaves no session behind
+					expect( svc.db.query( "SELECT COUNT(*) AS n FROM sessions WHERE data NOT LIKE '%userId%'" ).n ).toBe( 0 )
+
+					var scheduled = admin.get( "/api/posts?status=scheduled" )
+					expect( scheduled.json.posts.map( ( p ) => p.title ) ).toBe( [ "Later post" ] )
+				} )
+
+				it( "lets an author change only their own posts", () => {
+					var admin = signedIn()
+					var adminPost = admin.post( "/api/posts", { title: "Admin's post", body: "x" } ).json
+					var author = signedIn( TestSupport::AUTHOR_USER )
+					var own = author.post( "/api/posts", { title: "Writer's post", body: "y" } )
+					expect( own.status ).toBe( 201 )
+					expect( author.put( "/api/posts/#own.json.id#", { title: "Writer's post, edited" } ).json.title ).toBe( "Writer's post, edited" )
+					expect( author.put( "/api/posts/#adminPost.id#", { title: "Mine now" } ).status ).toBe( 403 )
+					expect( author.delete( "/api/posts/#adminPost.id#" ).status ).toBe( 403 )
+					expect( author.get( "/api/posts" ).json.posts.map( ( p ) => p.title ) ).toBe( [ "Writer's post, edited" ] )
+					expect( admin.delete( "/api/posts/#own.json.id#" ).status ).toBe( 204 )
+				} )
+
+				it( "keeps a history of saves, and one autosave", () => {
+					var admin = signedIn()
+					var post = admin.post( "/api/posts", { title: "Versions", body: "one" } ).json
+					admin.put( "/api/posts/#post.id#", { body: "two" } )
+					admin.put( "/api/posts/#post.id#", { body: "two" } )
+					admin.put( "/api/posts/#post.id#/autosave", { title: "Versions", body: "three, unsaved" } )
+					var history = admin.get( "/api/posts/#post.id#/revisions" ).json
+					expect( history.map( ( r ) => r.kind ) ).toBe( [ "autosave", "save", "save" ] )
+					var autosave = admin.get( "/api/posts/#post.id#/revisions/#history[ 1 ].id#" ).json
+					expect( autosave.body ).toBe( "three, unsaved" )
+					expect( admin.get( "/api/posts/#post.id#" ).json.body ).toBe( "two" )
+				} )
+
+				it( "finds posts by search, and logs what readers looked for", () => {
+					var admin = signedIn()
+					admin.post( "/api/posts", { title: "Virtual threads in practice", body: "Concurrency without callbacks.", status: "published" } )
+					admin.post( "/api/posts", { title: "Something else", body: "Unrelated.", status: "published" } )
+					var reader = new ApiClient( baseUrl )
+					var found = reader.get( "/search?q=concurrency" )
+					expect( found.status ).toBe( 200 )
+					expect( found.body ).toInclude( "Virtual threads in practice" )
+					expect( found.body ).notToInclude( "Something else" )
+					expect( reader.get( "/search?q=xyzzy" ).body ).toInclude( "Nothing matched" )
+					var searches = admin.get( "/api/admin/insights/audience" ).json
+					expect( searches.zeroSearches.map( ( s ) => s.label ) ).toInclude( "xyzzy" )
+				} )
+			} )
+
+			describe( "Feeds", () => {
+
+				it( "lists public posts in the feed and sitemap, with absolute addresses", () => {
+					var admin = signedIn()
+					admin.post( "/api/posts", { title: "Feed me", body: "![pic](/uploads/a.png)", status: "published" } )
+					admin.post( "/api/posts", { title: "Hidden draft", body: "x" } )
+					var reader = new ApiClient( baseUrl )
+					var feed = reader.get( "/feed.xml" )
+					expect( feed.status ).toBe( 200 )
+					expect( isXML( feed.body ) ).toBeTrue()
+					expect( feed.body ).toInclude( "<link>http://blog.example.test/posts/feed-me</link>" )
+					expect( feed.body ).toInclude( "http://blog.example.test/uploads/a.png" )
+					expect( feed.body ).notToInclude( "Hidden draft" )
+					var sitemap = reader.get( "/sitemap.xml" )
+					expect( isXML( sitemap.body ) ).toBeTrue()
+					expect( sitemap.body ).toInclude( "http://blog.example.test/posts/feed-me" )
+					expect( reader.get( "/robots.txt" ).body ).toInclude( "Sitemap: http://blog.example.test/sitemap.xml" )
+				} )
+			} )
+
+			describe( "Media and settings", () => {
+
+				it( "takes an image upload, and refuses what isn't one", () => {
+					var author = signedIn( TestSupport::AUTHOR_USER )
+					var uploaded = author.post( "/api/media?name=pic.png", TestSupport::png( 64, 48 ), { "Content-Type": "image/png" } )
+					expect( uploaded.status ).toBe( 201, uploaded.body )
+					expect( uploaded.json.width ).toBe( 64 )
+					expect( uploaded.json.url ).toInclude( "https://cdn.example/media/" )
+					expect( author.post( "/api/media?name=x.png", "not an image", { "Content-Type": "image/png" } ).status ).toBe( 400 )
+					expect( author.get( "/api/media" ).json.total ).toBe( 1 )
+					var admin = signedIn()
+					admin.post( "/api/posts", { title: "Uses it", body: "![x](#uploaded.json.url#)" } )
+					expect( admin.delete( "/api/media/#uploaded.json.id#" ).status ).toBe( 409 )
+					expect( admin.delete( "/api/media/#uploaded.json.id#?force=true" ).status ).toBe( 204 )
+				} )
+
+				it( "saves site settings and shows them on the site", () => {
+					var admin = signedIn()
+					expect( admin.put( "/api/admin/settings", { postsPerPage: 0 } ).status ).toBe( 400 )
+					var saved = admin.put( "/api/admin/settings", { title: "My Notebook", tagline: "Notes on things", accentColor: "##ff5500" } )
+					expect( saved.status ).toBe( 200, saved.body )
+					var reader = new ApiClient( baseUrl )
+					expect( reader.get( "/" ).body ).toInclude( "My Notebook" )
+					expect( reader.get( "/theme.css" ).body ).toInclude( "##ff5500" )
+				} )
+
+				it( "manages accounts, and won't leave the site without an admin", () => {
+					var admin = signedIn()
+					var created = admin.post( "/api/admin/users", { username: "newbie", email: "newbie@example.test", password: "long-enough-1", role: "author" } )
+					expect( created.status ).toBe( 201, created.body )
+					expect( new ApiClient( baseUrl ).login( "newbie", "long-enough-1" ).status ).toBe( 200 )
+					expect( admin.patch( "/api/admin/users/#created.json.id#", { disabled: true } ).json.disabled ).toBeTrue()
+					expect( new ApiClient( baseUrl ).login( "newbie", "long-enough-1" ).status ).toBe( 401 )
+					expect( admin.patch( "/api/admin/users/#TestSupport::userId( svc )#", { role: "author" } ).status ).toBe( 400 )
+					expect( admin.delete( "/api/admin/users/#created.json.id#" ).status ).toBe( 204 )
+				} )
+			} )
+
+			describe( "Server metrics", () => {
+
+				it( "shows admins the running server, and records it hourly", () => {
+					var admin = signedIn()
+					admin.get( "/api/posts" )
+					var answer = admin.get( "/api/admin/server" )
+					expect( answer.status ).toBe( 200, answer.body )
+					var snap = answer.json.snapshot
+					expect( snap.memory.heapUsed ).toBeGT( 0 )
+					expect( snap.threads.live ).toBeGT( 0 )
+					expect( snap.mysql.version ).notToBe( "" )
+					expect( snap.routes.map( ( r ) => r.route ) ).toInclude( "GET /api/posts" )
+					expect( answer.json.history ).toBe( [] )
+					svc.history.record()
+					expect( admin.get( "/api/admin/server" ).json.history.len() ).toBe( 1 )
+				} )
+			} )
+		} )
+	}
+
+}

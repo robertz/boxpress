@@ -1,0 +1,108 @@
+import services.ApiError;
+import routes.Http;
+
+/**
+ * Posts in the admin. An author lists and changes only their own posts; an
+ * admin, anyone's.
+ *
+ *   GET    /api/posts?status=&q=&authorId=&page=   a page of posts, without bodies
+ *   POST   /api/posts                               a new post
+ *   GET    /api/posts/calendar?from=&to=            published and scheduled posts between two instants, and drafts
+ *   POST   /api/posts/preview                       { body } as the post page would show it
+ *   GET    /api/posts/:id                           one post, with its Markdown
+ *   PUT    /api/posts/:id                           changes it
+ *   DELETE /api/posts/:id
+ *   PUT    /api/posts/:id/autosave                  the editor's unsaved work
+ *   GET    /api/posts/:id/revisions                 its history
+ *   GET    /api/posts/:id/revisions/:revisionId     one revision in full
+ */
+class {
+
+	static void function register( required router, required struct svc ) {
+		var posts     = arguments.svc.posts
+		var revisions = arguments.svc.revisions
+
+		// the post, or 404; 403 when this user may not change it
+		var editable = ( req ) => {
+			var post = posts.get( Http::pathId( req.params ) )
+			if ( post.isEmpty() ) {
+				ApiError::notFound( "No such post" )
+			}
+			if ( !posts.canEdit( req.user, post ) ) {
+				ApiError::forbidden( "That's another author's post" )
+			}
+			return post
+		}
+
+		arguments.router.get( "/posts", ( req, res ) => {
+			var status = lcase( trim( req.query.status ?: "all" ) )
+			if ( !listFind( "all,draft,scheduled,published", status ) ) {
+				ApiError::badRequest( "status must be all, draft, scheduled or published" )
+			}
+			var authorId = req.user.isAdmin ? Http::queryId( req.query, "authorId" ) : req.user.id
+			var found = posts.adminPage(
+				Http::queryInt( req.query, "page", 1, 1, 100000 ),
+				Http::queryInt( req.query, "pageSize", 25, 1, 100 ),
+				{ status: status, authorId: authorId, q: left( req.query.q ?: "", 100 ) }
+			)
+			var views = posts.viewTotals( found.posts.map( ( p ) => p.id ) )
+			for ( var post in found.posts ) {
+				post.views = views[ post.id ] ?: 0
+			}
+			res.json( found )
+		} )
+
+		arguments.router.post( "/posts", ( req, res ) => {
+			res.status( 201 ).json( posts.create( req.user.id, Http::body( req ) ) )
+		} )
+
+		arguments.router.get( "/posts/calendar", ( req, res ) => {
+			var fromIso = trim( req.query.from ?: "" )
+			var toIso   = trim( req.query.to ?: "" )
+			if ( !len( fromIso ) || !len( toIso ) ) {
+				ApiError::badRequest( "from and to are required, as ISO 8601 times" )
+			}
+			var scope = req.user.isAdmin ? 0 : req.user.id
+			res.json( { posts: posts.inRange( fromIso, toIso, scope ), drafts: posts.drafts( 50, scope ) } )
+		} )
+
+		arguments.router.post( "/posts/preview", ( req, res ) => {
+			var payload = Http::body( req )
+			res.json( posts.preview( isSimpleValue( payload.body ?: "" ) ? ( payload.body ?: "" ) : "" ) )
+		} )
+
+		arguments.router.get( "/posts/:id", ( req, res ) => {
+			res.json( editable( req ) )
+		} )
+
+		arguments.router.put( "/posts/:id", ( req, res ) => {
+			var post = editable( req )
+			res.json( posts.update( post.id, req.user.id, Http::body( req ) ) )
+		} )
+
+		arguments.router.delete( "/posts/:id", ( req, res ) => {
+			var post = editable( req )
+			posts.remove( post.id )
+			res.status( 204 ).end()
+		} )
+
+		arguments.router.put( "/posts/:id/autosave", ( req, res ) => {
+			var post = editable( req )
+			revisions.autosave( post.id, req.user.id, Http::body( req ) )
+			res.status( 204 ).end()
+		} )
+
+		arguments.router.get( "/posts/:id/revisions", ( req, res ) => {
+			res.json( revisions.list( editable( req ).id ) )
+		} )
+
+		arguments.router.get( "/posts/:id/revisions/:revisionId", ( req, res ) => {
+			var found = revisions.get( editable( req ).id, Http::pathId( req.params, "revisionId" ) )
+			if ( found.isEmpty() ) {
+				ApiError::notFound( "No such revision" )
+			}
+			res.json( found )
+		} )
+	}
+
+}

@@ -1,0 +1,12 @@
+node_modules/
+web/dist/
+server/boxlang_modules/
+server/testbox/
+server/tests/results/
+server/uploads/
+backups/
+.env
+server/.env
+*.log
+.DS_Store
+.claude/

@@ -1,0 +1,98 @@
+/**
+ * Errors a route can throw to produce a specific HTTP response. The error
+ * middleware maps the type to a status and sends { error, code, message }.
+ */
+class {
+
+	static {
+		STATUS = {
+			"Api.BadRequest"   : 400,
+			"Api.Unauthorized" : 401,
+			"Api.Forbidden"    : 403,
+			"Api.PasskeyRequired" : 403,
+			"Api.NotFound"     : 404,
+			"Api.Conflict"     : 409,
+			"Api.TooLarge"     : 413,
+			"Api.Unprocessable": 422,
+			"Api.TooMany"      : 429,
+			"Api.Unavailable"  : 503
+		}
+	}
+
+	static function badRequest( required string message ) {
+		throw( type = "Api.BadRequest", message = arguments.message )
+	}
+
+	static function notFound( string message = "Not found" ) {
+		throw( type = "Api.NotFound", message = arguments.message )
+	}
+
+	static function conflict( required string message, struct extra = {} ) {
+		throw( type = "Api.Conflict", message = arguments.message, extendedInfo = jsonSerialize( arguments.extra ) )
+	}
+
+	static function unprocessable( required string message, struct extra = {} ) {
+		throw( type = "Api.Unprocessable", message = arguments.message, extendedInfo = jsonSerialize( arguments.extra ) )
+	}
+
+	static function forbidden( string message = "Admins only" ) {
+		throw( type = "Api.Forbidden", message = arguments.message )
+	}
+
+	/** An admin whose session hasn't been confirmed with a passkey: code passkey_required, so the client can ask for one. */
+	static function passkeyRequired( string message = "Confirm it's you with a passkey first" ) {
+		throw( type = "Api.PasskeyRequired", message = arguments.message )
+	}
+
+	static function tooMany( required string message ) {
+		throw( type = "Api.TooMany", message = arguments.message )
+	}
+
+	/** Something the server relies on (another service) can't answer just now. */
+	static function unavailable( required string message ) {
+		throw( type = "Api.Unavailable", message = arguments.message )
+	}
+
+	static function unauthorized( string message = "Not logged in" ) {
+		throw( type = "Api.Unauthorized", message = arguments.message )
+	}
+
+	/**
+	 * Services throw <Service>.Invalid, .Forbidden, .Banned, .Exists and the like
+	 * (Groups.Invalid, Posts.Forbidden): those map by their last part, so routes
+	 * needn't catch and rethrow each one.
+	 */
+	static numeric function statusFor( required string type ) {
+		if ( static.STATUS.keyExists( arguments.type ) ) {
+			return static.STATUS[ arguments.type ]
+		}
+		switch ( listLast( arguments.type, "." ) ) {
+			case "Invalid"  : return 400
+			case "Forbidden":
+			case "Banned"   : return 403
+			case "NotFound" : return 404
+			case "Exists"   :
+			case "EmailTaken":
+			case "GitHubTaken":
+			case "LastAdmin":
+			case "Conflict" : return 409
+			default         : return 500
+		}
+	}
+
+	static string function codeFor( required numeric status ) {
+		switch ( arguments.status ) {
+			case 400: return "bad_request"
+			case 401: return "unauthorized"
+			case 403: return "forbidden"
+			case 404: return "not_found"
+			case 409: return "conflict"
+			case 413: return "too_large"
+			case 422: return "unprocessable"
+			case 429: return "rate_limited"
+			case 503: return "unavailable"
+			default : return "server_error"
+		}
+	}
+
+}

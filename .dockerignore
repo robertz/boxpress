@@ -1,0 +1,11 @@
+.git
+.claude
+**/node_modules
+web/dist
+server/.env
+server/uploads
+server/boxlang_modules
+server/testbox
+server/tests/results
+backups
+.env

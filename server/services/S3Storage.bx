@@ -1,0 +1,206 @@
+/**
+ * Puts and deletes objects in an S3-compatible bucket (Cloudflare R2, AWS S3,
+ * MinIO, Backblaze B2...), whose public address (publicBaseUrl) serves them.
+ * Requests use path-style addresses (endpoint/bucket/key) and are signed as
+ * presigned URLs (AWS Signature V4, host header only) so the bytes go up
+ * unsigned; Content-Type and Cache-Control ride along as plain headers the
+ * store keeps with the object. Unconfigured until every setting is present.
+ */
+class {
+
+	// https://<account>.r2.cloudflarestorage.com, https://s3.<region>.amazonaws.com, http://minio:9000
+	property name="endpoint" type="string";
+	property name="region" type="string";
+	property name="bucket" type="string";
+	property name="accessKeyId" type="string";
+	property name="secretAccessKey" type="string";
+	property name="publicBaseUrl" type="string";
+	property name="client";
+
+	/** @settings { endpoint, region, bucket, accessKeyId, secretAccessKey, publicBaseUrl } */
+	function init( required struct settings ) {
+		variables.endpoint        = reReplace( arguments.settings.endpoint ?: "", "/+$", "" )
+		variables.region          = len( arguments.settings.region ?: "" ) ? arguments.settings.region : "auto"
+		variables.bucket          = arguments.settings.bucket ?: ""
+		variables.accessKeyId     = arguments.settings.accessKeyId ?: ""
+		variables.secretAccessKey = arguments.settings.secretAccessKey ?: ""
+		variables.publicBaseUrl   = reReplace( arguments.settings.publicBaseUrl ?: "", "/+$", "" )
+		variables.client          = createObject( "java", "java.net.http.HttpClient" )
+			.newBuilder()
+			.connectTimeout( createObject( "java", "java.time.Duration" ).ofSeconds( 5 ) )
+			.build()
+		return this
+	}
+
+	boolean function isConfigured() {
+		return len( variables.endpoint ) && len( variables.bucket ) && len( variables.accessKeyId )
+			&& len( variables.secretAccessKey ) && len( variables.publicBaseUrl )
+	}
+
+	/** Scheme and host of the public address, for the page's Content-Security-Policy; "" when unconfigured. */
+	string function publicOrigin() {
+		if ( !isConfigured() ) {
+			return ""
+		}
+		var address = createObject( "java", "java.net.URI" ).create( variables.publicBaseUrl )
+		return address.getScheme() & "://" & address.getAuthority()
+	}
+
+	string function publicUrl( required string key ) {
+		return variables.publicBaseUrl & "/" & arguments.key
+	}
+
+	/** @throws S3Storage.Error */
+	void function putObject( required string key, required body, required string contentType, string cacheControl = "" ) {
+		var headers = { "Content-Type": arguments.contentType }
+		if ( len( arguments.cacheControl ) ) {
+			headers[ "Cache-Control" ] = arguments.cacheControl
+		}
+		var status = send( "PUT", arguments.key, headers, arguments.body )
+		if ( status < 200 || status >= 300 ) {
+			throw( type: "S3Storage.Error", message: "PUT #arguments.key# answered HTTP #status#" )
+		}
+	}
+
+	/** S3 answers 204 whether or not the key existed. @throws S3Storage.Error */
+	void function deleteObject( required string key ) {
+		var status = send( "DELETE", arguments.key )
+		if ( status < 200 || status >= 300 ) {
+			throw( type: "S3Storage.Error", message: "DELETE #arguments.key# answered HTTP #status#" )
+		}
+	}
+
+	/** The object's bytes. @throws S3Storage.Error */
+	function getObject( required string key ) {
+		var response = signedGet( objectPath( arguments.key ) )
+		if ( response.statusCode() != 200 ) {
+			throw( type: "S3Storage.Error", message: "GET #arguments.key# answered HTTP #response.statusCode()#" )
+		}
+		return response.body()
+	}
+
+	/** Every key under this prefix, a thousand to a request. @throws S3Storage.Error */
+	array function listKeys( required string prefix ) {
+		var keys = []
+		var token = ""
+		do {
+			var query = { "list-type": "2", "prefix": arguments.prefix }
+			if ( len( token ) ) {
+				query[ "continuation-token" ] = token
+			}
+			var response = signedGet( "/" & variables.bucket, query )
+			if ( response.statusCode() != 200 ) {
+				throw( type: "S3Storage.Error", message: "Listing #arguments.prefix# answered HTTP #response.statusCode()#" )
+			}
+			var listing = createObject( "java", "java.lang.String" ).init( response.body(), "UTF-8" )
+			for ( var key in reMatch( "<Key>[^<]*</Key>", listing ) ) {
+				keys.append( xmlText( mid( key, 6, len( key ) - 11 ) ) )
+			}
+			var next = reMatch( "<NextContinuationToken>[^<]*</NextContinuationToken>", listing )
+			token = next.len() ? xmlText( mid( next[ 1 ], 24, len( next[ 1 ] ) - 47 ) ) : ""
+		} while ( len( token ) )
+		return keys
+	}
+
+	private string function xmlText( required string escaped ) {
+		return arguments.escaped.replace( "&lt;", "<" ).replace( "&gt;", ">" ).replace( "&quot;", """" ).replace( "&apos;", "'" ).replace( "&amp;", "&" )
+	}
+
+	/** A signed GET whose answer's body is kept. @throws S3Storage.Error */
+	private function signedGet( required string canonicalUri, struct query = {} ) {
+		var built = createObject( "java", "java.net.http.HttpRequest" )
+			.newBuilder()
+			.uri( createObject( "java", "java.net.URI" ).create( presign( "GET", arguments.canonicalUri, 60, arguments.query ) ) )
+			.timeout( createObject( "java", "java.time.Duration" ).ofSeconds( 20 ) )
+			.GET()
+			.build()
+		try {
+			return variables.client.send( built, createObject( "java", "java.net.http.HttpResponse$BodyHandlers" ).ofByteArray() )
+		} catch ( any e ) {
+			throw( type: "S3Storage.Error", message: "Couldn't reach the bucket: " & e.message )
+		}
+	}
+
+	private numeric function send( required string method, required string key, struct headers = {}, body ) {
+		var publishers = createObject( "java", "java.net.http.HttpRequest$BodyPublishers" )
+		var builder    = createObject( "java", "java.net.http.HttpRequest" )
+			.newBuilder()
+			.uri( createObject( "java", "java.net.URI" ).create( presign( arguments.method, objectPath( arguments.key ), 60 ) ) )
+			.timeout( createObject( "java", "java.time.Duration" ).ofSeconds( 20 ) )
+		for ( var name in arguments.headers ) {
+			builder = builder.header( name, arguments.headers[ name ] )
+		}
+		builder = builder.method( arguments.method, isNull( arguments.body ) ? publishers.noBody() : publishers.ofByteArray( arguments.body ) )
+		try {
+			return variables.client
+				.send( builder.build(), createObject( "java", "java.net.http.HttpResponse$BodyHandlers" ).discarding() )
+				.statusCode()
+		} catch ( any e ) {
+			throw( type: "S3Storage.Error", message: "Couldn't reach the bucket: " & e.message )
+		}
+	}
+
+	/** Each key segment percent-encoded, the slashes between them kept. */
+	private string function objectPath( required string key ) {
+		return "/" & variables.bucket & "/" & listToArray( arguments.key, "/" ).map( ( segment ) => uriEncode( segment ) ).toList( "/" )
+	}
+
+	private string function presign( required string method, required string canonicalUri, required numeric expiresSeconds, struct query = {} ) {
+		var base      = createObject( "java", "java.net.URI" ).create( variables.endpoint )
+		var host      = base.getAuthority()
+		var amzDate   = createObject( "java", "java.time.format.DateTimeFormatter" )
+			.ofPattern( "yyyyMMdd'T'HHmmss'Z'" )
+			.withZone( createObject( "java", "java.time.ZoneOffset" ).UTC )
+			.format( createObject( "java", "java.time.Instant" ).now() )
+		var dateStamp = left( amzDate, 8 )
+		var scope     = dateStamp & "/" & variables.region & "/s3/aws4_request"
+		var params    = {
+			"X-Amz-Algorithm"     : "AWS4-HMAC-SHA256",
+			"X-Amz-Credential"    : variables.accessKeyId & "/" & scope,
+			"X-Amz-Date"          : amzDate,
+			"X-Amz-Expires"       : arguments.expiresSeconds,
+			"X-Amz-SignedHeaders" : "host"
+		}
+		params.append( arguments.query )
+		var names = structKeyArray( params )
+		arraySort( names, "text" )
+		var query = names.map( ( name ) => uriEncode( name ) & "=" & uriEncode( toString( params[ name ] ) ) ).toList( "&" )
+
+		var lf = char( 10 )
+		var canonicalRequest = arguments.method & lf & arguments.canonicalUri & lf & query & lf
+			& "host:" & host & lf & lf & "host" & lf & "UNSIGNED-PAYLOAD"
+		var stringToSign = "AWS4-HMAC-SHA256" & lf & amzDate & lf & scope & lf
+			& hexOf( createObject( "java", "java.security.MessageDigest" ).getInstance( "SHA-256" ).digest( canonicalRequest.getBytes( "UTF-8" ) ) )
+
+		var signingKey = hmacBytes( ( "AWS4" & variables.secretAccessKey ).getBytes( "UTF-8" ), dateStamp )
+		for ( var part in [ variables.region, "s3", "aws4_request" ] ) {
+			signingKey = hmacBytes( signingKey, part )
+		}
+		return base.getScheme() & "://" & host & arguments.canonicalUri & "?" & query & "&X-Amz-Signature=" & hexOf( hmacBytes( signingKey, stringToSign ) )
+	}
+
+	/** RFC 3986 unreserved characters kept, everything else %XX, as SigV4 wants. */
+	private string function uriEncode( required string value ) {
+		var out = createObject( "java", "java.lang.StringBuilder" ).init()
+		for ( var b in arguments.value.getBytes( "UTF-8" ) ) {
+			var c = bitAnd( b, 255 )
+			if ( ( c >= 65 && c <= 90 ) || ( c >= 97 && c <= 122 ) || ( c >= 48 && c <= 57 ) || c == 45 || c == 46 || c == 95 || c == 126 ) {
+				out.append( char( c ) )
+			} else {
+				out.append( "%" & uCase( right( "0" & formatBaseN( c, 16 ), 2 ) ) )
+			}
+		}
+		return out.toString()
+	}
+
+	private function hmacBytes( required keyBytes, required string data ) {
+		var mac = createObject( "java", "javax.crypto.Mac" ).getInstance( "HmacSHA256" )
+		mac.init( createObject( "java", "javax.crypto.spec.SecretKeySpec" ).init( arguments.keyBytes, "HmacSHA256" ) )
+		return mac.doFinal( arguments.data.getBytes( "UTF-8" ) )
+	}
+
+	private string function hexOf( required bytes ) {
+		return createObject( "java", "java.util.HexFormat" ).of().formatHex( arguments.bytes )
+	}
+
+}

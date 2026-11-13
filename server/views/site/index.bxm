@@ -1,0 +1,36 @@
+<bx:include template="_head.bxm">
+<bx:output>
+<div class="wrap">
+	<bx:if data.paging.page == 1 && ( len( data.site.tagline ) || len( data.site.description ) )>
+	<section class="intro">
+		<bx:if len( data.site.tagline )><h1 class="intro__title">#encodeForHTML( data.site.tagline )#</h1></bx:if>
+		<bx:if len( data.site.description )><p class="intro__text">#encodeForHTML( data.site.description )#</p></bx:if>
+	</section>
+	<bx:else>
+	<h1 class="visually-hidden">#encodeForHTML( data.site.title )#</h1>
+	</bx:if>
+
+	<bx:if data.paging.posts.len()>
+	<div class="post-list">
+		<bx:loop array="#data.paging.posts#" item="post">
+			<bx:include template="_postCard.bxm">
+		</bx:loop>
+	</div>
+	<bx:include template="_pagination.bxm">
+	<bx:else>
+	<p class="empty">Nothing here yet. Sign in at <a href="/admin">/admin</a> to write the first post.</p>
+	</bx:if>
+
+	<bx:if data.paging.page == 1 && data.topTags.len()>
+	<section class="topics" aria-labelledby="topics-heading">
+		<h2 id="topics-heading" class="section-heading">Topics</h2>
+		<p class="tag-cloud">
+		<bx:loop array="#data.topTags#" item="tag">
+			<a href="/tag/#encodeForURL( tag.slug )#" class="tag-pill">#encodeForHTML( tag.name )# <span>#tag.posts#</span></a>
+		</bx:loop>
+		</p>
+	</section>
+	</bx:if>
+</div>
+</bx:output>
+<bx:include template="_foot.bxm">

@@ -1,0 +1,10 @@
+/**
+ * boxlang run-tests.bxs   (run from server/; needs `box install` and the MySQL container)
+ */
+tb = new "testbox.system.TestBox"( directory = "tests.specs", reporter = "text" )
+println( tb.run() )
+
+result = tb.getResult()
+if ( result.getTotalFail() > 0 || result.getTotalError() > 0 ) {
+	createObject( "java", "java.lang.System" ).exit( 1 )
+}

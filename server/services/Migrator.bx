@@ -1,0 +1,72 @@
+/**
+ * Applies numbered SQL files (001_name.sql, 002_name.sql, ...) in order and
+ * records the highest applied number in schema_version. MySQL commits DDL
+ * implicitly, so a failed file is not rolled back: fix it and rerun. A file
+ * that stopped partway (a deploy killed mid-ALTER) can simply run again: a
+ * statement whose change is already there is skipped (ALREADY_DONE).
+ */
+class {
+
+	property name="db";
+	property name="directory" type="string";
+
+	static {
+		// MySQL's errors for a column, index, key or table that's already there (1060, 1061, 1050, 1826)
+		ALREADY_DONE = "^(Duplicate column name|Duplicate key name|Table '[^']+' already exists|Duplicate foreign key constraint name)"
+	}
+
+	function init( required db, required string directory ) {
+		variables.db        = arguments.db
+		variables.directory = arguments.directory
+		return this
+	}
+
+	array function run() {
+		variables.db.execute( "CREATE TABLE IF NOT EXISTS schema_version ( version INT NOT NULL PRIMARY KEY, applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP )" )
+		var current = currentVersion()
+		var applied = []
+
+		for ( var migration in pending( current ) ) {
+			for ( var statement in splitStatements( fileRead( migration.path ) ) ) {
+				try {
+					variables.db.execute( statement )
+				} catch ( database e ) {
+					if ( !reFind( static.ALREADY_DONE, e.message ) ) {
+						rethrow;
+					}
+					println( "[migrate] #migration.name#: #e.message#, so that statement already ran; skipped" )
+				}
+			}
+			variables.db.execute( "INSERT INTO schema_version ( version ) VALUES ( ? )", [ migration.version ] )
+			applied.append( migration.name )
+		}
+		return applied
+	}
+
+	numeric function currentVersion() {
+		var q = variables.db.query( "SELECT COALESCE( MAX( version ), 0 ) AS v FROM schema_version" )
+		return q.v
+	}
+
+	private array function pending( required numeric current ) {
+		return directoryList( variables.directory, false, "name", "*.sql", "name" )
+			.filter( ( name ) => reFind( "^\d+_", name ) )
+			.map( ( name ) => {
+				return { name: name, version: val( listFirst( name, "_" ) ), path: variables.directory & "/" & name }
+			} )
+			.filter( ( m ) => m.version > current )
+			.sort( ( a, b ) => a.version - b.version )
+	}
+
+	/**
+	 * Splits on semicolons that end a line. Good enough for hand-written
+	 * migrations; a semicolon inside a string literal at end of line would break it.
+	 */
+	private array function splitStatements( required string sqlText ) {
+		var pieces = createObject( "java", "java.util.regex.Pattern" ).compile( ";\s*(\r?\n|$)" ).split( arguments.sqlText )
+		return arrayNew( 1 ).append( pieces, true )
+			.map( ( s ) => trim( s ) )
+			.filter( ( s ) => len( s ) && !reFind( "^(--[^\n]*\s*)+$", s ) )
+	}
+
+}

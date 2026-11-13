@@ -1,0 +1,95 @@
+/**
+ * Passkeys (WebAuthn): signing in without a password, and the second proof
+ * an admin's session needs before it may use admin powers (adminAllowed).
+ * The WebAuthn checks are bx-passkeys' (its RelyingParty); what's ours is the
+ * rule for admins and the list under Account, kept in user_passkeys (PasskeyStore).
+ */
+class {
+
+	property name="db";
+	property name="settings";
+	property name="party";
+
+	static {
+		MAX_PER_USER = 20
+	}
+
+	/** settings: { rpId, rpName, origins, requiredForAdmins } */
+	function init( required db, required struct settings ) {
+		variables.db = arguments.db
+		variables.settings = arguments.settings
+		variables.party = new bxModules.bxPasskeys.models.RelyingParty(
+			{ rpId: arguments.settings.rpId, rpName: arguments.settings.rpName, origins: arguments.settings.origins ?: [], maxPerUser: static.MAX_PER_USER },
+			new services.PasskeyStore( arguments.db )
+		)
+		return this
+	}
+
+	boolean function requiredForAdmins() {
+		return variables.settings.requiredForAdmins ?: true
+	}
+
+	/** Whether this session may use the admin powers its account has: it signed in, or confirmed, with a passkey. */
+	boolean function adminAllowed( required struct sessionData ) {
+		return !requiredForAdmins() || ( arguments.sessionData.passkey ?: false ) == true
+	}
+
+	/** [ { id, name, createdAt, lastUsedAt } ], the newest first. */
+	array function list( required numeric userId ) {
+		return variables.db.query(
+			"SELECT id, name, DATE_FORMAT( created_at, '%Y-%m-%dT%H:%i:%sZ' ) AS createdAt, DATE_FORMAT( last_used_at, '%Y-%m-%dT%H:%i:%sZ' ) AS lastUsedAt
+			FROM user_passkeys WHERE user_id = ? ORDER BY id DESC",
+			[ arguments.userId ],
+			{ returnType: "array" }
+		).map( ( r ) => {
+			return { id: r.id, name: r.name, createdAt: r.createdAt, lastUsedAt: len( r.lastUsedAt ?: "" ) ? r.lastUsedAt : javacast( "null", "" ) }
+		} )
+	}
+
+	numeric function count( required numeric userId ) {
+		return variables.db.query( "SELECT COUNT(*) AS n FROM user_passkeys WHERE user_id = ?", [ arguments.userId ] ).n
+	}
+
+	boolean function remove( required numeric userId, required numeric passkeyId ) {
+		return variables.db.execute( "DELETE FROM user_passkeys WHERE id = ? AND user_id = ?", [ arguments.passkeyId, arguments.userId ] ).recordCount > 0
+	}
+
+	/** Every passkey of the account, for scripts/users.bxs when one is lost. */
+	numeric function removeAll( required numeric userId ) {
+		return variables.db.execute( "DELETE FROM user_passkeys WHERE user_id = ?", [ arguments.userId ] ).recordCount
+	}
+
+	/** PublicKeyCredentialCreationOptionsJSON for a new passkey on this account. */
+	struct function registrationOptions( required struct user, required struct sessionData ) {
+		return variables.party.registrationOptions( handleOf( arguments.user ), arguments.sessionData )
+	}
+
+	/** Saves the new passkey from the browser's answer, and answers it as list() does. Throws Passkeys.Invalid. */
+	struct function register( required struct user, required struct sessionData, required struct answer ) {
+		variables.party.register( handleOf( arguments.user ), arguments.sessionData, arguments.answer )
+		return list( arguments.user.id ).first()
+	}
+
+	/**
+	 * PublicKeyCredentialRequestOptionsJSON. With a user (confirming who's
+	 * already signed in) only their passkeys are offered; without one the
+	 * browser offers whichever of this site's passkeys it has.
+	 */
+	struct function signInOptions( required struct sessionData, numeric userId = 0 ) {
+		return variables.party.signInOptions( arguments.sessionData, arguments.userId ? toString( arguments.userId ) : "" )
+	}
+
+	/** The user id the passkey belongs to. Throws Passkeys.Invalid for anything that doesn't check out. */
+	numeric function verify( required struct sessionData, required struct answer ) {
+		return val( variables.party.verify( arguments.sessionData, arguments.answer ).userId )
+	}
+
+	private struct function handleOf( required struct user ) {
+		return {
+			id          : toString( arguments.user.id ),
+			name        : arguments.user.username,
+			displayName : len( arguments.user.display_name ?: "" ) ? arguments.user.display_name : arguments.user.username
+		}
+	}
+
+}

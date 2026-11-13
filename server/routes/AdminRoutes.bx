@@ -1,0 +1,163 @@
+import services.ApiError;
+import routes.Http;
+import routes.AuthRoutes;
+
+/**
+ * Admins only (behind requireAdmin).
+ *
+ *   GET    /api/admin/users              every account
+ *   POST   /api/admin/users              { username, email, password, role, displayName? }
+ *   PATCH  /api/admin/users/:id          { role?, disabled?, displayName?, bio?, avatarUrl?, website?, email?, password? }
+ *   DELETE /api/admin/users/:id          only an account with no posts or uploads
+ *   POST   /api/admin/users/:id/passkeys/clear   for an author who lost theirs
+ *   GET    /api/admin/settings           the site's settings
+ *   PUT    /api/admin/settings           changes some of them
+ *   GET    /api/admin/stats              content counts
+ *   GET    /api/admin/server?hours=      the running server now, and its hourly records
+ *   GET    /api/admin/insights/traffic   page views by day, last 30 days and the 30 before
+ *   GET    /api/admin/insights/audience?limit=   referrers, searches, 404s, top posts
+ *   GET    /api/admin/requests?q=&method=&status=&before=&after=   the raw request log
+ *   POST   /api/admin/rerender           renders every post's Markdown again
+ */
+class {
+
+	static void function register( required router, required struct svc ) {
+		var users      = arguments.svc.users
+		var passkeys   = arguments.svc.passkeys
+		var site       = arguments.svc.site
+		var db         = arguments.svc.db
+		var monitor    = arguments.svc.monitor
+		var history    = arguments.svc.history
+		var insights   = arguments.svc.insights
+		var requestLog = arguments.svc.requestLog
+		var posts      = arguments.svc.posts
+
+		var account = ( req ) => {
+			var found = users.get( Http::pathId( req.params ) )
+			if ( found.isEmpty() ) {
+				ApiError::notFound( "No such user" )
+			}
+			return found
+		}
+
+		arguments.router.get( "/admin/users", ( req, res ) => res.json( users.list() ) )
+
+		arguments.router.post( "/admin/users", ( req, res ) => {
+			var payload = Http::body( req )
+			var created = users.create(
+				AuthRoutes::optionalString( payload, "username" ),
+				isSimpleValue( payload.password ?: "" ) ? ( payload.password ?: "" ) : "",
+				len( AuthRoutes::optionalString( payload, "role" ) ) ? AuthRoutes::optionalString( payload, "role" ) : "author",
+				AuthRoutes::optionalString( payload, "email" ),
+				AuthRoutes::optionalString( payload, "displayName" )
+			)
+			res.status( 201 ).json( users.list( created.id )[ 1 ] )
+		} )
+
+		arguments.router.patch( "/admin/users/:id", ( req, res ) => {
+			var target  = account( req )
+			var payload = Http::body( req )
+			if ( payload.keyExists( "role" ) ) {
+				if ( target.id == req.user.id && payload.role != "admin" ) {
+					ApiError::badRequest( "You can't take away your own admin role" )
+				}
+				users.setRole( target.id, AuthRoutes::optionalString( payload, "role" ) )
+			}
+			if ( payload.keyExists( "disabled" ) ) {
+				if ( !Http::isBoolean( payload.disabled ) ) {
+					ApiError::badRequest( "disabled must be true or false" )
+				}
+				if ( payload.disabled && target.id == req.user.id ) {
+					ApiError::badRequest( "You can't disable your own account" )
+				}
+				users.setDisabled( target.id, payload.disabled )
+			}
+			if ( payload.keyExists( "password" ) ) {
+				users.setPassword( target.id, isSimpleValue( payload.password ?: "" ) ? ( payload.password ?: "" ) : "" )
+			}
+			users.updateProfile( target.id, payload.filter( ( key ) => listFindNoCase( "displayName,bio,avatarUrl,website,email", key ) ) )
+			res.json( users.list( target.id )[ 1 ] )
+		} )
+
+		arguments.router.delete( "/admin/users/:id", ( req, res ) => {
+			var target = account( req )
+			if ( target.id == req.user.id ) {
+				ApiError::badRequest( "You can't delete your own account" )
+			}
+			users.remove( target.id )
+			res.status( 204 ).end()
+		} )
+
+		arguments.router.post( "/admin/users/:id/passkeys/clear", ( req, res ) => {
+			var target = account( req )
+			res.json( { removed: passkeys.removeAll( target.id ) } )
+		} )
+
+		arguments.router.get( "/admin/settings", ( req, res ) => res.json( site.all() ) )
+
+		arguments.router.put( "/admin/settings", ( req, res ) => res.json( site.save( Http::body( req ) ) ) )
+
+		arguments.router.get( "/admin/stats", ( req, res ) => {
+			res.json( db.query(
+				"SELECT
+					( SELECT COUNT(*) FROM users ) AS users,
+					( SELECT COUNT(*) FROM posts ) AS posts,
+					( SELECT COUNT(*) FROM posts WHERE status = 'published' AND published_at <= UTC_TIMESTAMP() ) AS published,
+					( SELECT COUNT(*) FROM tags ) AS tags,
+					( SELECT COUNT(*) FROM media ) AS media,
+					( SELECT COUNT(*) FROM sessions WHERE expires_at > UTC_TIMESTAMP() ) AS sessions,
+					( SELECT COUNT(*) FROM request_log WHERE requested_at >= DATE_SUB( UTC_TIMESTAMP(), INTERVAL 1 DAY ) ) AS requestsToday",
+				[],
+				{ returnType: "array" }
+			)[ 1 ] )
+		} )
+
+		/** The running server now, and its hourly records over ?hours= (default 48, at most 90 days). */
+		arguments.router.get( "/admin/server", ( req, res ) => {
+			res.json( {
+				snapshot : monitor.snapshot().append( { requestLogQueued: requestLog.queued() } ),
+				history  : history.recent( Http::queryInt( req.query, "hours", 48, 1, 24 * 90 ) )
+			} )
+		} )
+
+		arguments.router.get( "/admin/insights/traffic", ( req, res ) => res.json( insights.traffic() ) )
+
+		/** Each list that fails to load comes back null, so the others still show. */
+		arguments.router.get( "/admin/insights/audience", ( req, res ) => {
+			var rowLimit = Http::queryInt( req.query, "limit", 6, 1, 25 )
+			var orNull = ( loader ) => {
+				try {
+					return loader()
+				} catch ( any e ) {
+					println( "[insights] a list failed: #e.message#" )
+					return javacast( "null", "" )
+				}
+			}
+			res.json( {
+				referrers    : orNull( () => insights.topReferrers( 30, rowLimit ) ),
+				posts        : orNull( () => insights.topPosts( 30, rowLimit ) ),
+				searches     : orNull( () => insights.topSearches( 30, rowLimit ) ),
+				zeroSearches : orNull( () => insights.topSearches( 30, rowLimit, true ) ),
+				notFound     : orNull( () => insights.top404s( 30, rowLimit ) )
+			} )
+		} )
+
+		arguments.router.get( "/admin/requests", ( req, res ) => {
+			var method = uCase( trim( req.query.method ?: "" ) )
+			var status = lcase( trim( req.query.status ?: "" ) )
+			res.json( requestLog.recent(
+				{
+					path   : left( trim( req.query.q ?: "" ), 500 ),
+					method : listFind( "GET,POST,HEAD,PUT,PATCH,DELETE,OPTIONS", method ) ? method : "",
+					status : listFind( "2xx,3xx,4xx,5xx", status ) ? status : ""
+				},
+				Http::queryInt( req.query, "before", 0, 0, 999999999 ),
+				Http::queryInt( req.query, "after", 0, 0, 999999999 ),
+				50
+			) )
+		} )
+
+		arguments.router.post( "/admin/rerender", ( req, res ) => res.json( { rendered: posts.rerenderAll() } ) )
+	}
+
+}

@@ -1,0 +1,96 @@
+import services.Bootstrap;
+import tests.helpers.FakeStorage;
+
+/**
+ * Builds the service graph against the boxpress_test database, and seeds
+ * accounts for the specs.
+ */
+class {
+
+	static {
+		ADMIN_USER    = "tester"
+		AUTHOR_USER   = "writer"
+		TEST_PASSWORD = "test-password-123"
+		// hashed once: bcrypt salts every call
+		TEST_HASH     = bcryptHash( TEST_PASSWORD )
+		FULL_TEXT_CLEARED = false
+	}
+
+	static struct function services( struct overrides = {} ) {
+		var settings = Bootstrap::loadSettings( {
+			// the same server as the app's datasource, but always the boxpress_test database
+			datasource : {
+				driver   : "mysql",
+				host     : getSystemSetting( "BOXPRESS_DB_HOST", "127.0.0.1" ),
+				port     : getSystemSetting( "BOXPRESS_DB_PORT", "3306" ),
+				database : "boxpress_test",
+				username : getSystemSetting( "BOXPRESS_DB_USER", "root" ),
+				password : getSystemSetting( "BOXPRESS_DB_PASSWORD", "" ),
+				// top-level, not in custom: bx-mysql's driver defaults turn these on and override the URL
+				useServerPrepStmts     : false,
+				cachePrepStmts         : false,
+				cacheResultSetMetadata : false,
+				custom                 : "connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true"
+			},
+			siteUrl  : "http://blog.example.test",
+			siteHost : "blog.example.test",
+			server   : { requestLog: false, production: false, environment: "test", webRoot: "/nonexistent", trustProxyHeader: "", canonicalHost: false },
+			auth     : { username: "", passwordHash: "", email: "", sessionDays: 30, maxLoginAttempts: 1000 },
+			passkeys : { rpId: "localhost", rpName: "BoxPress", origins: [], requiredForAdmins: false }
+		} )
+		for ( var section in arguments.overrides ) {
+			if ( isStruct( settings[ section ] ?: "" ) && isStruct( arguments.overrides[ section ] ) ) {
+				settings[ section ].append( arguments.overrides[ section ] )
+			} else {
+				settings[ section ] = arguments.overrides[ section ]
+			}
+		}
+		// never a real bucket, whatever server/.env says
+		return Bootstrap::build( settings, { storage: new FakeStorage() } )
+	}
+
+	/** Empties every table and seeds ADMIN_USER (an admin) and AUTHOR_USER, sharing TEST_PASSWORD. */
+	static void function resetDatabase( required struct svc ) {
+		var db = arguments.svc.db
+		arguments.svc.migrator.run()
+		for ( var table in [ "post_views_daily", "post_revisions", "post_tags", "tags", "posts", "media", "user_passkeys", "sessions",
+			"users", "site_settings", "search_log", "request_log", "request_log_daily", "server_metrics" ] ) {
+			db.execute( "DELETE FROM #table#" )
+		}
+		clearFullTextDeletes( db )
+		db.execute(
+			"INSERT INTO users ( username, email, display_name, password_hash, role ) VALUES ( ?, ?, 'Test Admin', ?, 'admin' ), ( ?, ?, 'Test Writer', ?, 'author' )",
+			[ static.ADMIN_USER, emailFor( static.ADMIN_USER ), static.TEST_HASH, static.AUTHOR_USER, emailFor( static.AUTHOR_USER ), static.TEST_HASH ]
+		)
+	}
+
+	/**
+	 * InnoDB keeps deleted rows' full-text doc ids on a list until the table is
+	 * optimized; with every row deleted between specs, a new row can be given
+	 * one of them and never be found. Rebuilding once a run clears the list.
+	 */
+	private static void function clearFullTextDeletes( required db ) {
+		if ( static.FULL_TEXT_CLEARED ) {
+			return
+		}
+		arguments.db.query( "OPTIMIZE TABLE posts", [], { returnType: "array" } )
+		static.FULL_TEXT_CLEARED = true
+	}
+
+	/** A real PNG of this size. */
+	static function png( numeric width = 40, numeric height = 30 ) {
+		var image = createObject( "java", "java.awt.image.BufferedImage" ).init( arguments.width, arguments.height, 1 )
+		var out = createObject( "java", "java.io.ByteArrayOutputStream" ).init()
+		createObject( "java", "javax.imageio.ImageIO" ).write( image, "png", out )
+		return out.toByteArray()
+	}
+
+	static string function emailFor( required string username ) {
+		return lcase( arguments.username ) & "@example.test"
+	}
+
+	static numeric function userId( required struct svc, string username = "" ) {
+		return arguments.svc.users.findByUsername( len( arguments.username ) ? arguments.username : static.ADMIN_USER ).id
+	}
+
+}

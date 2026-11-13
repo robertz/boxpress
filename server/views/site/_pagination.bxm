@@ -1,0 +1,18 @@
+<bx:output>
+<bx:if data.paging.totalPages gt 1>
+<bx:set pageBase = data.currentPath & ( len( data.query ?: "" ) ? "?q=" & encodeForURL( data.query ) & "&" : "?" )>
+<nav class="pagination" aria-label="Pages">
+	<bx:if data.paging.page gt 1>
+		<a href="#encodeForHTMLAttribute( data.paging.page == 2 && !len( data.query ?: "" ) ? data.currentPath : pageBase & "page=" & ( data.paging.page - 1 ) )#" rel="prev">&larr; Newer</a>
+	<bx:else>
+		<span></span>
+	</bx:if>
+	<span class="pagination__status">Page #data.paging.page# of #data.paging.totalPages#</span>
+	<bx:if data.paging.page lt data.paging.totalPages>
+		<a href="#encodeForHTMLAttribute( pageBase & "page=" & ( data.paging.page + 1 ) )#" rel="next">Older &rarr;</a>
+	<bx:else>
+		<span></span>
+	</bx:if>
+</nav>
+</bx:if>
+</bx:output>

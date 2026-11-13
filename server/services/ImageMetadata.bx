@@ -1,0 +1,252 @@
+/**
+ * Takes out what an image says about where and how it was made: EXIF (GPS,
+ * camera serial numbers, its own thumbnail of the uncropped picture), XMP,
+ * IPTC, comments and text, and anything after the image's end, where phones
+ * append more pictures with their own EXIF. The pixels aren't re-encoded:
+ * only the blocks around them go, and the ones decoding needs (colour
+ * profiles, animation) stay. The browser already re-encodes photos without
+ * any of this; this covers whatever reaches the server another way.
+ */
+class {
+
+	static {
+		// PNG chunks that are the image or how to show it; any other goes
+		PNG_KEEP = "IHDR,PLTE,IDAT,IEND,tRNS,cHRM,gAMA,iCCP,sBIT,sRGB,cICP,mDCv,cLLi,bKGD,hIST,pHYs,sPLT,acTL,fcTL,fdAT"
+		WEBP_KEEP = "VP8 ,VP8L,VP8X,ALPH,ANIM,ANMF,ICCP"
+		// a GIF's own application extensions: how often an animation loops
+		GIF_APPS = "NETSCAPE2.0,ANIMEXTS1.0"
+	}
+
+	/** The image without its metadata. @throws Media.Invalid when its structure can't be followed. */
+	static function strip( required bytes, required string type ) {
+		var data = arguments.bytes
+		var out = createObject( "java", "java.io.ByteArrayOutputStream" ).init( javaCast( "int", data.length ) )
+		try {
+			switch ( arguments.type ) {
+				case "image/jpeg":
+					jpeg( data, out )
+					break
+				case "image/png":
+					png( data, out )
+					break
+				case "image/webp":
+					webp( data, out )
+					break
+				case "image/gif":
+					gif( data, out )
+					break
+				default:
+					throw( type = "Media.Invalid", message = "Not an image this can clean" )
+			}
+		} catch ( "Media.Invalid" e ) {
+			rethrow;
+		} catch ( any e ) {
+			throw( type = "Media.Invalid", message = "That image couldn't be read" )
+		}
+		return out.toByteArray()
+	}
+
+	/** Reads byte i (from 0) as 0-255. Through a ByteBuffer: indexing the byte[] itself copies it on every read. */
+	private static function byteAt( required bytes ) {
+		var buffer = createObject( "java", "java.nio.ByteBuffer" ).wrap( arguments.bytes )
+		return ( i ) => bitAnd( buffer.get( javaCast( "int", i ) ), 255 )
+	}
+
+	/**
+	 * Segments up to the first scan, the scans, then the end marker; nothing
+	 * after it. Kept: the JFIF header (without its thumbnail), the ICC
+	 * profile, Adobe's colour transform, and every non-APP segment.
+	 */
+	private static function jpeg( required bytes, required sink ) {
+		var data = arguments.bytes
+		var out = arguments.sink
+		var n = data.length
+		var u = byteAt( data )
+		var copy = ( from, to ) => out.write( data, javaCast( "int", from ), javaCast( "int", to - from ) )
+		// as one character a byte, so the next marker after a scan's data can be found by regex
+		var latin = createObject( "java", "java.lang.String" ).init( data, "ISO-8859-1" )
+		var nextMarker = createObject( "java", "java.util.regex.Pattern" ).compile( "\xFF[^\x00\xD0-\xD7\xFF]" ).matcher( latin )
+		copy( 0, 2 )
+		var pos = 2
+		while ( true ) {
+			if ( pos + 1 >= n || u( pos ) != 255 ) {
+				throw( type = "Media.Invalid", message = "That image couldn't be read" )
+			}
+			var marker = u( pos + 1 )
+			if ( marker == 255 ) {
+				pos += 1
+				continue
+			}
+			if ( marker == 217 ) {
+				copy( pos, pos + 2 )
+				return
+			}
+			if ( marker == 1 || ( marker >= 208 && marker <= 215 ) ) {
+				copy( pos, pos + 2 )
+				pos += 2
+				continue
+			}
+			if ( pos + 3 >= n ) {
+				throw( type = "Media.Invalid", message = "That image couldn't be read" )
+			}
+			var segmentEnd = pos + 2 + u( pos + 2 ) * 256 + u( pos + 3 )
+			if ( segmentEnd > n ) {
+				throw( type = "Media.Invalid", message = "That image couldn't be read" )
+			}
+			var label = ( size ) => segmentEnd - pos - 4 >= size ? mid( latin, pos + 5, size ) : ""
+			if ( marker == 224 ) {
+				if ( label( 5 ) == "JFIF#char( 0 )#" && segmentEnd - pos >= 18 ) {
+					// its 16 bytes, with no thumbnail
+					for ( var b in [ 255, 224, 0, 16 ] ) {
+						out.write( javaCast( "int", b ) )
+					}
+					copy( pos + 4, pos + 16 )
+					out.write( javaCast( "int", 0 ) )
+					out.write( javaCast( "int", 0 ) )
+				}
+			} else if ( marker == 226 ) {
+				if ( label( 12 ) == "ICC_PROFILE#char( 0 )#" ) {
+					copy( pos, segmentEnd )
+				}
+			} else if ( marker == 238 ) {
+				if ( label( 5 ) == "Adobe" ) {
+					copy( pos, segmentEnd )
+				}
+			} else if ( marker < 225 || marker > 239 ) {
+				if ( marker != 254 ) {
+					copy( pos, segmentEnd )
+				}
+			}
+			pos = segmentEnd
+			if ( marker == 218 ) {
+				// the scan's data runs to the next marker that isn't a restart or a stuffed byte
+				if ( !nextMarker.find( javaCast( "int", pos ) ) ) {
+					throw( type = "Media.Invalid", message = "That image couldn't be read" )
+				}
+				copy( pos, nextMarker.start() )
+				pos = nextMarker.start()
+			}
+		}
+	}
+
+	/** The signature, then the kept chunks up to IEND. */
+	private static function png( required bytes, required sink ) {
+		var data = arguments.bytes
+		var out = arguments.sink
+		var n = data.length
+		var u = byteAt( data )
+		out.write( data, 0, 8 )
+		var pos = 8
+		while ( pos + 12 <= n ) {
+			var size = ( ( u( pos ) * 256 + u( pos + 1 ) ) * 256 + u( pos + 2 ) ) * 256 + u( pos + 3 )
+			var name = char( u( pos + 4 ) ) & char( u( pos + 5 ) ) & char( u( pos + 6 ) ) & char( u( pos + 7 ) )
+			var chunkEnd = pos + 12 + size
+			if ( chunkEnd > n ) {
+				break
+			}
+			if ( listFind( static.PNG_KEEP, name ) ) {
+				out.write( data, javaCast( "int", pos ), javaCast( "int", chunkEnd - pos ) )
+			}
+			if ( name == "IEND" ) {
+				return
+			}
+			pos = chunkEnd
+		}
+		throw( type = "Media.Invalid", message = "That image couldn't be read" )
+	}
+
+	/** The kept chunks, VP8X's flags for EXIF and XMP cleared, and RIFF's size made right again. */
+	private static function webp( required bytes, required sink ) {
+		var data = arguments.bytes
+		var out = arguments.sink
+		var n = data.length
+		var u = byteAt( data )
+		var riffEnd = min( n, 8 + u( 4 ) + u( 5 ) * 256 + u( 6 ) * 65536 + u( 7 ) * 16777216 )
+		out.write( data, 0, 12 )
+		var pos = 12
+		while ( pos + 8 <= riffEnd ) {
+			var name = char( u( pos ) ) & char( u( pos + 1 ) ) & char( u( pos + 2 ) ) & char( u( pos + 3 ) )
+			var size = u( pos + 4 ) + u( pos + 5 ) * 256 + u( pos + 6 ) * 65536 + u( pos + 7 ) * 16777216
+			var chunkEnd = pos + 8 + size + size % 2
+			if ( pos + 8 + size > riffEnd ) {
+				throw( type = "Media.Invalid", message = "That image couldn't be read" )
+			}
+			if ( listFind( static.WEBP_KEEP, name ) ) {
+				var copyEnd = min( chunkEnd, riffEnd )
+				if ( name == "VP8X" ) {
+					out.write( data, javaCast( "int", pos ), 8 )
+					out.write( javaCast( "int", bitAnd( u( pos + 8 ), 243 ) ) )
+					out.write( data, javaCast( "int", pos + 9 ), javaCast( "int", copyEnd - pos - 9 ) )
+				} else {
+					out.write( data, javaCast( "int", pos ), javaCast( "int", copyEnd - pos ) )
+				}
+				if ( copyEnd < chunkEnd ) {
+					out.write( javaCast( "int", 0 ) )
+				}
+			}
+			pos = chunkEnd
+		}
+		var cleaned = out.toByteArray()
+		var buffer = createObject( "java", "java.nio.ByteBuffer" ).wrap( cleaned )
+		buffer.order( createObject( "java", "java.nio.ByteOrder" ).LITTLE_ENDIAN ).putInt( javaCast( "int", 4 ), javaCast( "int", arrayLen( cleaned ) - 8 ) )
+		out.reset()
+		out.write( cleaned )
+	}
+
+	/** Header and colour table, then frames and the extensions they need, to the trailer. */
+	private static function gif( required bytes, required sink ) {
+		var data = arguments.bytes
+		var out = arguments.sink
+		var n = data.length
+		var at = byteAt( data )
+		var u = ( i ) => {
+			if ( i >= n ) {
+				throw( type = "Media.Invalid", message = "That image couldn't be read" )
+			}
+			return at( i )
+		}
+		var copy = ( from, to ) => out.write( data, javaCast( "int", from ), javaCast( "int", to - from ) )
+		// past a run of sub-blocks, ending with the empty one
+		var skipBlocks = ( from ) => {
+			var at = from
+			while ( u( at ) != 0 ) {
+				at += u( at ) + 1
+			}
+			return at + 1
+		}
+		var colorTable = ( flags ) => bitAnd( flags, 128 ) ? 3 * 2 ^ ( bitAnd( flags, 7 ) + 1 ) : 0
+		var pos = 13 + colorTable( u( 10 ) )
+		copy( 0, pos )
+		while ( true ) {
+			var kind = u( pos )
+			if ( kind == 59 ) {
+				copy( pos, pos + 1 )
+				return
+			}
+			if ( kind == 44 ) {
+				var dataStart = pos + 10 + colorTable( u( pos + 9 ) ) + 1
+				var frameEnd = skipBlocks( dataStart )
+				copy( pos, frameEnd )
+				pos = frameEnd
+			} else if ( kind == 33 ) {
+				var label = u( pos + 1 )
+				var extensionEnd = skipBlocks( pos + 2 )
+				var keep = label == 249 || label == 1
+				if ( label == 255 && u( pos + 2 ) == 11 ) {
+					var app = ""
+					for ( var i = 0; i < 11; i++ ) {
+						app &= char( u( pos + 3 + i ) )
+					}
+					keep = listFind( static.GIF_APPS, app ) > 0
+				}
+				if ( keep ) {
+					copy( pos, extensionEnd )
+				}
+				pos = extensionEnd
+			} else {
+				throw( type = "Media.Invalid", message = "That image couldn't be read" )
+			}
+		}
+	}
+
+}

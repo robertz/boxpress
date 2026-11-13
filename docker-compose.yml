@@ -1,0 +1,94 @@
+# BoxPress in production: the app, MySQL 8 and a nightly backup.
+#
+#   cp .env.example .env      # then fill it in
+#   docker compose up -d --build
+#
+# The app listens on APP_PORT (8080) on this host. Put a reverse proxy that
+# terminates HTTPS in front of it (Caddy, nginx, Traefik, a Cloudflare
+# tunnel), and set SITE_URL to the address readers use.
+
+name: boxpress
+
+services:
+  app:
+    build:
+      context: .
+      target: app
+    image: boxpress:latest
+    restart: unless-stopped
+    mem_limit: ${APP_MEMORY:-1g}
+    cpus: ${APP_CPUS:-2}
+    env_file: .env
+    environment:
+      ENV: production
+      PORT: "8080"
+      BOXPRESS_DB_HOST: db
+      BOXPRESS_DB_PORT: "3306"
+      BOXPRESS_DB_NAME: ${MYSQL_DATABASE:-boxpress}
+      BOXPRESS_DB_USER: ${MYSQL_USER:-boxpress}
+      BOXPRESS_DB_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+    ports:
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8080}:8080"
+    volumes:
+      # uploaded images, when no S3 bucket is configured
+      - uploads:/app/uploads
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # BoxLang compiles on first start, and migrations run before it listens
+      start_period: 90s
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  db:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-boxpress}
+      MYSQL_USER: ${MYSQL_USER:-boxpress}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    volumes:
+      - mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging: *logging
+
+  # nightly dumps into ./backups (production/backup.sh); `docker compose run --rm backup now` takes one at once
+  backup:
+    image: mysql:8.4
+    restart: unless-stopped
+    entrypoint: ["bash", "/usr/local/bin/backup.sh"]
+    environment:
+      DB_HOST: db
+      DB_NAME: ${MYSQL_DATABASE:-boxpress}
+      DB_USER: ${MYSQL_USER:-boxpress}
+      DB_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+      BACKUP_HOUR_UTC: ${BACKUP_HOUR_UTC:-8}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+    volumes:
+      - ./production/backup.sh:/usr/local/bin/backup.sh:ro
+      - ./backups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+    logging: *logging
+
+volumes:
+  mysql: {}
+  uploads: {}

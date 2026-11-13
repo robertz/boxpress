@@ -1,0 +1,78 @@
+import services.ApiError;
+import routes.Http;
+
+/**
+ * The media library.
+ *
+ *   GET    /api/media?page=&q=&mine=   a page of images, newest first
+ *   POST   /api/media?name=            the image itself as the request body (any Content-Type; Media checks the bytes)
+ *   PATCH  /api/media/:id              { alt }
+ *   DELETE /api/media/:id
+ *
+ * Everyone sees the whole library (to reuse an image); an author changes or
+ * removes only their own uploads.
+ */
+class {
+
+	static void function register( required router, required struct svc ) {
+		var media    = arguments.svc.media
+		var maxBytes = arguments.svc.settings.uploads.maxBytes
+		var uploadLimiter = boxExpressRateLimit( {
+			windowMs     : 60 * 60 * 1000,
+			max          : arguments.svc.settings.uploads.perHour ?: 200,
+			message      : "That's a lot of uploads. Try again in a while.",
+			keyGenerator : ( req ) => "uploads:" & req.user.id
+		} )
+
+		var owned = ( req ) => {
+			var found = media.get( Http::pathId( req.params ) )
+			if ( found.isEmpty() ) {
+				ApiError::notFound( "No such image" )
+			}
+			if ( !req.user.isAdmin && found.owner_id != req.user.id ) {
+				ApiError::forbidden( "That's another author's image" )
+			}
+			return found
+		}
+
+		arguments.router.get( "/media", ( req, res ) => {
+			res.json( media.list(
+				Http::queryInt( req.query, "page", 1, 1, 100000 ),
+				Http::queryInt( req.query, "pageSize", 48, 1, 100 ),
+				Http::queryFlag( req.query, "mine" ) ? req.user.id : 0,
+				left( req.query.q ?: "", 100 )
+			) )
+		} )
+
+		arguments.router.post( "/media", uploadLimiter, ( req, res ) => {
+			try {
+				res.status( 201 ).json( media.upload( req.user.id, Http::readRawBytes( req, maxBytes ), req.query.name ?: "" ) )
+			} catch ( "S3Storage.Error" e ) {
+				println( "[media] upload failed: #e.message#" )
+				ApiError::unavailable( "Couldn't store that image just now. Try again in a moment." )
+			}
+		} )
+
+		arguments.router.patch( "/media/:id", ( req, res ) => {
+			var found = owned( req )
+			var payload = Http::body( req )
+			res.json( media.setAlt( found.id, isSimpleValue( payload.alt ?: "" ) ? ( payload.alt ?: "" ) : "" ) )
+		} )
+
+		/** ?force=true removes it even while posts still show it; without, 409 with { usage }. */
+		arguments.router.delete( "/media/:id", ( req, res ) => {
+			var found = owned( req )
+			var usage = media.usage( found.url )
+			if ( usage && !Http::queryFlag( req.query, "force" ) ) {
+				ApiError::conflict( "#usage# #usage == 1 ? 'post uses' : 'posts use'# this image", { usage: usage } )
+			}
+			try {
+				media.remove( found.id )
+			} catch ( "S3Storage.Error" e ) {
+				ApiError::unavailable( "Couldn't remove that image just now. Try again in a moment." )
+			}
+			res.status( 204 ).end()
+		} )
+	}
+
+}

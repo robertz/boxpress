@@ -1,0 +1,61 @@
+<bx:output><!doctype html>
+<html lang="#encodeForHTMLAttribute( data.site.language )#">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>#encodeForHTML( len( data.pageTitle ?: "" ) ? data.pageTitle & " · " & data.site.title : data.site.title & ( len( data.site.tagline ) ? " · " & data.site.tagline : "" ) )#</title>
+<bx:if len( data.description ?: "" )>
+<meta name="description" content="#encodeForHTMLAttribute( data.description )#">
+</bx:if>
+<meta name="robots" content="#encodeForHTMLAttribute( data.robots )#">
+<link rel="canonical" href="#encodeForHTMLAttribute( data.canonicalUrl )#">
+<link rel="alternate" type="application/rss+xml" title="#encodeForHTMLAttribute( data.site.title )#" href="/feed.xml">
+<meta property="og:site_name" content="#encodeForHTMLAttribute( data.site.title )#">
+<meta property="og:type" content="#encodeForHTMLAttribute( data.ogType )#">
+<meta property="og:title" content="#encodeForHTMLAttribute( len( data.pageTitle ?: "" ) ? data.pageTitle : data.site.title )#">
+<meta property="og:url" content="#encodeForHTMLAttribute( data.canonicalUrl )#">
+<bx:if len( data.description ?: "" )>
+<meta property="og:description" content="#encodeForHTMLAttribute( data.description )#">
+</bx:if>
+<bx:if len( data.ogImage ?: "" )>
+<meta property="og:image" content="#encodeForHTMLAttribute( data.ogImage )#">
+<meta name="twitter:card" content="summary_large_image">
+<bx:else>
+<meta name="twitter:card" content="summary">
+</bx:if>
+<bx:if structKeyExists( data, "post" )>
+<meta property="article:published_time" content="#encodeForHTMLAttribute( data.post.publishedAt )#">
+<meta property="article:modified_time" content="#encodeForHTMLAttribute( data.post.updatedAt )#">
+<bx:loop array="#data.post.tags#" item="headTag">
+<meta property="article:tag" content="#encodeForHTMLAttribute( headTag.name )#">
+</bx:loop>
+</bx:if>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<bx:if len( data.siteCss ?: "" )>
+<link rel="stylesheet" href="#data.siteCss#">
+</bx:if>
+<link rel="stylesheet" href="/theme.css">
+<bx:if len( data.siteJs ?: "" )>
+<script type="module" src="#data.siteJs#"></script>
+</bx:if>
+</head>
+<body>
+<a class="skip-link" href="##main">Skip to content</a>
+<header class="site-header">
+	<div class="wrap site-header__inner">
+		<a href="/" class="site-title">#encodeForHTML( data.site.title )#</a>
+		<nav class="site-nav" aria-label="Site">
+			<a href="/" #data.currentPath == "/" ? 'aria-current="page"' : ''#>Posts</a>
+			<a href="/tags" #data.currentPath == "/tags" || left( data.currentPath, 5 ) == "/tag/" ? 'aria-current="page"' : ''#>Tags</a>
+			<a href="/authors" #data.currentPath == "/authors" || left( data.currentPath, 8 ) == "/author/" ? 'aria-current="page"' : ''#>Authors</a>
+		</nav>
+		<form class="site-search" method="get" action="/search" role="search">
+			<label class="visually-hidden" for="site-search-q">Search</label>
+			<input id="site-search-q" type="search" name="q" placeholder="Search" value="#encodeForHTMLAttribute( data.query ?: "" )#">
+		</form>
+	</div>
+</header>
+<main id="main" tabindex="-1">
+</bx:output>

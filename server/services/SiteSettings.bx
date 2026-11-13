@@ -1,0 +1,111 @@
+/**
+ * What an admin can change about the site without a deploy (Admin > Settings):
+ * its title and tagline, the description search engines and feeds show, how
+ * many posts a page lists, the footer, a default sharing image and the
+ * accent colour. Read on every page, so held in memory; saving refreshes it.
+ */
+class {
+
+	property name="db";
+	property name="defaults";
+	property name="cache";
+
+	static {
+		FIELDS = {
+			title        : { max: 100,  kind: "text" },
+			tagline      : { max: 200,  kind: "text" },
+			description  : { max: 500,  kind: "text" },
+			postsPerPage : { min: 1, max: 50, kind: "int" },
+			footerText   : { max: 500,  kind: "text" },
+			socialImage  : { max: 1000, kind: "url" },
+			accentColor  : { max: 7,    kind: "color" },
+			language     : { max: 20,   kind: "language" }
+		}
+	}
+
+	/** defaults: the starting values (title from SITE_NAME), used until an admin saves their own. */
+	function init( required db, required struct defaults ) {
+		variables.db       = arguments.db
+		variables.defaults = {
+			title        : "BoxPress",
+			tagline      : "",
+			description  : "",
+			postsPerPage : 10,
+			footerText   : "",
+			socialImage  : "",
+			accentColor  : "##2563eb",
+			language     : "en"
+		}.append( arguments.defaults )
+		return this
+	}
+
+	struct function all() {
+		if ( isNull( variables.cache ) ) {
+			var values = duplicate( variables.defaults )
+			for ( var row in variables.db.query( "SELECT name, value FROM site_settings", [], { returnType: "array" } ) ) {
+				if ( static.FIELDS.keyExists( row.name ) ) {
+					values[ row.name ] = static.FIELDS[ row.name ].kind == "int" ? val( row.value ) : row.value
+				}
+			}
+			variables.cache = values
+		}
+		return duplicate( variables.cache )
+	}
+
+	/** Saves the fields given (the rest keep their values) and answers them all. Throws SiteSettings.Invalid. */
+	struct function save( required struct changes ) {
+		var checked = {}
+		for ( var name in arguments.changes ) {
+			if ( !static.FIELDS.keyExists( name ) ) {
+				continue
+			}
+			checked[ name ] = checkedValue( name, arguments.changes[ name ] )
+		}
+		for ( var name in checked ) {
+			variables.db.execute(
+				"INSERT INTO site_settings ( name, value ) VALUES ( ?, ? ) AS incoming ON DUPLICATE KEY UPDATE value = incoming.value",
+				[ name, toString( checked[ name ] ) ]
+			)
+		}
+		variables.cache = javacast( "null", "" )
+		return all()
+	}
+
+	private function checkedValue( required string name, value ) {
+		var field = static.FIELDS[ arguments.name ]
+		if ( isNull( arguments.value ) || !isSimpleValue( arguments.value ) ) {
+			throw( type = "SiteSettings.Invalid", message = "#arguments.name# must be text" )
+		}
+		var text = trim( toString( arguments.value ) )
+		switch ( field.kind ) {
+			case "int":
+				if ( !reFind( "^\d{1,3}$", text ) || text < field.min || text > field.max ) {
+					throw( type = "SiteSettings.Invalid", message = "#arguments.name# must be between #field.min# and #field.max#" )
+				}
+				return int( text )
+			case "url":
+				if ( len( text ) && !reFindNoCase( "^(https?://|/)[^\s""'<>]+$", text ) ) {
+					throw( type = "SiteSettings.Invalid", message = "#arguments.name# must be a web address" )
+				}
+				break
+			case "color":
+				if ( !reFind( "^##[0-9a-fA-F]{6}$", text ) ) {
+					throw( type = "SiteSettings.Invalid", message = "accentColor must be a colour like ##2563eb" )
+				}
+				return lcase( text )
+			case "language":
+				if ( !reFind( "^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$", text ) ) {
+					throw( type = "SiteSettings.Invalid", message = "language must be a language tag like en or pt-BR" )
+				}
+				break
+		}
+		if ( len( text ) > field.max ) {
+			throw( type = "SiteSettings.Invalid", message = "#arguments.name# is at most #field.max# characters" )
+		}
+		if ( arguments.name == "title" && !len( text ) ) {
+			throw( type = "SiteSettings.Invalid", message = "The site needs a title" )
+		}
+		return text
+	}
+
+}

@@ -1,0 +1,32 @@
+/**
+ *   /feed.xml      RSS 2.0, the latest posts in full (/rss and /feed redirect here)
+ *   /sitemap.xml   every public post, tag and author
+ *   /robots.txt
+ */
+class {
+
+	static void function register( required app, required struct svc ) {
+		var feeds = arguments.svc.feeds
+
+		arguments.app.get( "/feed.xml", ( req, res ) => {
+			res.set( "Cache-Control", "public, max-age=300" )
+				.type( "application/rss+xml; charset=UTF-8" )
+				.send( feeds.rss() )
+		} )
+		// the addresses feed readers try
+		for ( var alias in [ "/rss", "/rss.xml", "/feed", "/atom.xml" ] ) {
+			arguments.app.get( alias, ( req, res ) => res.redirect( "/feed.xml", 301 ) )
+		}
+
+		arguments.app.get( "/sitemap.xml", ( req, res ) => {
+			res.set( "Cache-Control", "public, max-age=3600" )
+				.type( "application/xml; charset=UTF-8" )
+				.send( feeds.sitemap() )
+		} )
+
+		arguments.app.get( "/robots.txt", ( req, res ) => {
+			res.type( "text/plain; charset=UTF-8" ).send( feeds.robots() )
+		} )
+	}
+
+}

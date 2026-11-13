@@ -1,0 +1,59 @@
+<bx:include template="_head.bxm">
+<bx:output>
+<article class="post wrap wrap--narrow">
+	<header class="post__header">
+		<bx:if data.post.tags.len()>
+		<p class="post__tags">
+			<bx:loop array="#data.post.tags#" item="tag">
+				<a href="/tag/#encodeForURL( tag.slug )#">#encodeForHTML( tag.name )#</a>
+			</bx:loop>
+		</p>
+		</bx:if>
+		<h1 class="post__title">#encodeForHTML( data.post.title )#</h1>
+		<bx:if len( data.post.excerpt )>
+		<p class="post__excerpt">#encodeForHTML( data.post.excerpt )#</p>
+		</bx:if>
+		<p class="post-meta">
+			<a href="/author/#encodeForURL( data.post.author.username )#">#encodeForHTML( data.post.author.displayName )#</a>
+			<span aria-hidden="true">&middot;</span>
+			<time datetime="#encodeForHTMLAttribute( data.post.publishedAt )#">#data.post.dateLabel#</time>
+			<span aria-hidden="true">&middot;</span>
+			<span>#data.post.readingMinutes# min read</span>
+		</p>
+	</header>
+
+	<bx:if len( data.post.coverImage )>
+	<img class="post__cover" src="#encodeForHTMLAttribute( data.post.coverImage )#" alt="">
+	</bx:if>
+
+	<div class="post__body prose">
+		#data.post.html#
+	</div>
+
+	<footer class="post__footer">
+		<div class="author-card">
+			<bx:if len( data.post.author.avatarUrl )>
+			<img class="author-card__avatar" src="#encodeForHTMLAttribute( data.post.author.avatarUrl )#" alt="">
+			<bx:else>
+			<span class="author-card__avatar" aria-hidden="true">#encodeForHTML( data.post.author.initials )#</span>
+			</bx:if>
+			<div>
+				<p class="author-card__name"><a href="/author/#encodeForURL( data.post.author.username )#">#encodeForHTML( data.post.author.displayName )#</a></p>
+				<bx:if len( data.post.author.bio )><p class="author-card__bio">#encodeForHTML( data.post.author.bio )#</p></bx:if>
+			</div>
+		</div>
+
+		<bx:if !data.neighbours.newer.isEmpty() || !data.neighbours.older.isEmpty()>
+		<nav class="post-nav" aria-label="More posts">
+			<bx:if !data.neighbours.older.isEmpty()>
+			<a class="post-nav__older" href="#encodeForHTMLAttribute( data.neighbours.older.url )#" rel="prev"><small>Older</small>#encodeForHTML( data.neighbours.older.title )#</a>
+			<bx:else><span></span></bx:if>
+			<bx:if !data.neighbours.newer.isEmpty()>
+			<a class="post-nav__newer" href="#encodeForHTMLAttribute( data.neighbours.newer.url )#" rel="next"><small>Newer</small>#encodeForHTML( data.neighbours.newer.title )#</a>
+			</bx:if>
+		</nav>
+		</bx:if>
+	</footer>
+</article>
+</bx:output>
+<bx:include template="_foot.bxm">

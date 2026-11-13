@@ -1,0 +1,122 @@
+/**
+ * Requests by route since the server started: how many, how many failed,
+ * the average and slowest time, and how many are open now (an /api/events
+ * stream stays open as long as its tab). Kept in this process's memory.
+ *
+ * A route is the method and the path with its ids, group slugs and
+ * usernames taken out (GET /api/posts/:id, GET /api/groups/:slug/posts).
+ * Pages and static files are grouped, so a scanner's made-up paths can't add
+ * a row each; past MAX_ROUTES the rest count as "other".
+ */
+class {
+
+	property name="routes";
+	property name="clock";
+
+	static {
+		MAX_ROUTES = 200
+	}
+
+	function init() {
+		variables.routes = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init()
+		variables.clock  = createObject( "java", "java.lang.System" )
+		return this
+	}
+
+	/**
+	 * For app.use(), first, so it times everything after it. Errors are
+	 * answered inside next(), so the status is final when it returns.
+	 */
+	function middleware() {
+		var stats = this
+		var clock = variables.clock
+		return ( req, res, next ) => {
+			var entry   = stats.entryFor( req.method, req.path )
+			var started = clock.nanoTime()
+			entry.open.incrementAndGet()
+			try {
+				next()
+			} finally {
+				entry.open.decrementAndGet()
+				stats.record( entry, res.getStatusCode(), clock.nanoTime() - started )
+			}
+		}
+	}
+
+	/** The counters for a request's route, made on first use. */
+	struct function entryFor( required string method, required string path ) {
+		var route = routeOf( arguments.method, arguments.path )
+		var entry = variables.routes.get( route )
+		if ( !isNull( entry ) ) {
+			return entry
+		}
+		if ( variables.routes.size() >= static.MAX_ROUTES ) {
+			route = "other"
+		}
+		var counter = () => createObject( "java", "java.util.concurrent.atomic.AtomicLong" ).init( 0 )
+		variables.routes.putIfAbsent( route, { requests: counter(), clientErrors: counter(), serverErrors: counter(), nanos: counter(), maxNanos: counter(), open: counter() } )
+		return variables.routes.get( route )
+	}
+
+	void function record( required struct entry, required numeric status, required numeric nanos ) {
+		var e = arguments.entry
+		e.requests.incrementAndGet()
+		if ( arguments.status >= 500 ) {
+			e.serverErrors.incrementAndGet()
+		} else if ( arguments.status >= 400 ) {
+			e.clientErrors.incrementAndGet()
+		}
+		e.nanos.addAndGet( arguments.nanos )
+		var slowest = e.maxNanos.get()
+		while ( arguments.nanos > slowest && !e.maxNanos.compareAndSet( slowest, arguments.nanos ) ) {
+			slowest = e.maxNanos.get()
+		}
+	}
+
+	/** [ { route, requests, clientErrors, serverErrors, averageMs, slowestMs, open } ], most requests first. */
+	array function current() {
+		var result = []
+		for ( var route in variables.routes.keySet() ) {
+			var e = variables.routes.get( route )
+			var requests = e.requests.get()
+			result.append( {
+				route        : route,
+				requests     : requests,
+				clientErrors : e.clientErrors.get(),
+				serverErrors : e.serverErrors.get(),
+				averageMs    : requests ? e.nanos.get() / requests / 1000000 : 0,
+				slowestMs    : e.maxNanos.get() / 1000000,
+				open         : e.open.get()
+			} )
+		}
+		return result.sort( ( a, b ) => sgn( b.requests - a.requests ) )
+	}
+
+	/** GET /api/posts/:id, GET /api/groups/:slug/posts, GET /assets/*, GET /uploads/*, GET page */
+	string function routeOf( required string method, required string path ) {
+		var parts = listToArray( arguments.path, "/" )
+		var route = ""
+		if ( !parts.len() ) {
+			route = "page"
+		} else if ( parts[ 1 ] == "assets" || parts[ 1 ] == "uploads" ) {
+			route = "/#parts[ 1 ]#/*"
+		} else if ( parts[ 1 ] == "api" || parts[ 1 ] == "health" ) {
+			var named = []
+			for ( var i = 1; i <= parts.len(); i++ ) {
+				// the segment after these names one: a group's slug, a person's username
+				var before = i > 1 ? parts[ i - 1 ] : ""
+				named.append( before == "groups" && i == 3 ? ":slug" : before == "people" && i == 3 ? ":username" : idless( parts[ i ] ) )
+			}
+			route = "/" & named.toList( "/" )
+		} else {
+			route = "page"
+		}
+		return uCase( arguments.method ) & " " & route
+	}
+
+	/** :id for a segment that's a number or a token, the segment otherwise. */
+	private string function idless( required string segment ) {
+		return reFind( "^\d+$", arguments.segment ) || ( len( arguments.segment ) >= 20 && reFind( "\d", arguments.segment ) ) ? ":id" : arguments.segment
+	}
+
+}

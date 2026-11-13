@@ -1,0 +1,123 @@
+/**
+ * The running server, recorded hourly in server_metrics and kept KEEP_DAYS,
+ * so the admin page can chart a trend: memory still in use after garbage
+ * collection, CPU, requests and errors.
+ *
+ * The per-hour figures are differences from the previous record, kept in
+ * memory: the first record after a restart has none.
+ */
+class {
+
+	property name="db";
+	property name="monitor";
+	// the previous record's running totals, for the per-hour figures
+	property name="previous";
+
+	static {
+		KEEP_DAYS = 90
+	}
+
+	function init( required db, required monitor ) {
+		variables.db      = arguments.db
+		variables.monitor = arguments.monitor
+		return this
+	}
+
+	/** Records the server now, and clears records past KEEP_DAYS. @return the record */
+	struct function record() {
+		var snap    = variables.monitor.snapshot()
+		var fullGcs = 0
+		var gcMs    = 0
+		for ( var collector in snap.collectors ) {
+			// G1's "G1 Old Generation", Parallel's "PS MarkSweep", Serial's "MarkSweepCompact"
+			if ( reFindNoCase( "old|marksweep|full", collector.name ) ) {
+				fullGcs += collector.collections
+			}
+			gcMs += collector.timeMs
+		}
+		var totals = {
+			uptime   : snap.jvm.uptimeSeconds,
+			cpu      : snap.cpu.processCpuSeconds ?: 0,
+			fullGcs  : fullGcs,
+			gcMs     : gcMs,
+			requests : isNull( snap.http ) ? 0 : snap.http.requests,
+			errors   : isNull( snap.http ) ? 0 : snap.http.errors,
+			gcCauses : snap.fullGcCauses
+		}
+		var before = variables.previous ?: {}
+		// a lower uptime is a restart: the totals started over
+		var hasBefore = !before.isEmpty() && totals.uptime > before.uptime
+		var since     = ( key ) => hasBefore ? max( totals[ key ] - before[ key ], 0 ) : javaCast( "null", "" )
+		var elapsed   = hasBefore ? totals.uptime - before.uptime : 0
+		var row = {
+			uptimeSeconds    : totals.uptime,
+			heapUsed         : snap.memory.heapUsed,
+			heapMax          : snap.memory.heapMax,
+			oldGenAfterGc    : snap.memory.oldGenAfterLastGc ?: javaCast( "null", "" ),
+			directUsed       : isNull( snap.memory.direct ) ? javaCast( "null", "" ) : snap.memory.direct.used,
+			openFiles        : isNull( snap.files ) ? javaCast( "null", "" ) : snap.files.open,
+			memoryFree       : snap.cpu.physicalMemoryFree ?: javaCast( "null", "" ),
+			cpuLoadHour      : hasBefore && elapsed > 0 ? min( max( totals.cpu - before.cpu, 0 ) / ( elapsed * snap.cpu.processors ), 1 ) : javaCast( "null", "" ),
+			fullGcsHour      : since( "fullGcs" ),
+			fullGcCausesHour : hasBefore ? causesSince( totals.gcCauses, before.gcCauses ) : javaCast( "null", "" ),
+			gcMsHour         : since( "gcMs" ),
+			httpRequestsHour : since( "requests" ),
+			httpErrorsHour   : since( "errors" )
+		}
+		variables.previous = totals
+		save( row )
+		variables.db.execute( "DELETE FROM server_metrics WHERE recorded_at < DATE_SUB( UTC_TIMESTAMP(), INTERVAL ? DAY )", [ { value: static.KEEP_DAYS, sqltype: "integer" } ] )
+		return row
+	}
+
+	/** The records of the last hours, oldest first (as a chart reads them). */
+	array function recent( numeric hours = 48 ) {
+		var rows = variables.db.query(
+			"SELECT DATE_FORMAT( recorded_at, '%Y-%m-%dT%H:%i:%sZ' ) AS recordedAt, uptime_seconds AS uptimeSeconds,
+				heap_used AS heapUsed, heap_max AS heapMax, old_gen_after_gc AS oldGenAfterGc, direct_used AS directUsed,
+				open_files AS openFiles, memory_free AS memoryFree,
+				cpu_load_hour AS cpuLoadHour, full_gcs_hour AS fullGcsHour, full_gc_causes_hour AS fullGcCausesHour, gc_ms_hour AS gcMsHour,
+				http_requests_hour AS httpRequestsHour, http_errors_hour AS httpErrorsHour
+			FROM server_metrics WHERE recorded_at >= DATE_SUB( UTC_TIMESTAMP(), INTERVAL ? HOUR )
+			ORDER BY recorded_at",
+			[ { value: max( 1, min( arguments.hours, 24 * static.KEEP_DAYS ) ), sqltype: "integer" } ],
+			{ returnType: "array" }
+		)
+		for ( var r in rows ) {
+			r.fullGcCausesHour = isJSON( r.fullGcCausesHour ?: "" ) ? jsonDeserialize( r.fullGcCausesHour ) : javaCast( "null", "" )
+		}
+		return rows
+	}
+
+	/** Each cause's full GCs since the previous record: [ { cause, collections, timeMs } ], those with any. */
+	private array function causesSince( required array now, required array before ) {
+		var result = []
+		for ( var c in arguments.now ) {
+			var prior = arguments.before.find( ( b ) => compare( b.cause, c.cause ) == 0 )
+			var collections = c.collections - ( prior ? arguments.before[ prior ].collections : 0 )
+			if ( collections > 0 ) {
+				result.append( { cause: c.cause, collections: collections, timeMs: c.timeMs - ( prior ? arguments.before[ prior ].timeMs : 0 ) } )
+			}
+		}
+		return result
+	}
+
+	private void function save( required struct row ) {
+		var r = arguments.row
+		var num = ( value, string type = "bigint" ) => { return { value: isNull( value ) ? "" : value, sqltype: type, null: isNull( value ) } }
+		variables.db.execute(
+			"INSERT INTO server_metrics ( recorded_at, uptime_seconds, heap_used, heap_max, old_gen_after_gc, direct_used, open_files, memory_free,
+				cpu_load_hour, full_gcs_hour, full_gc_causes_hour, gc_ms_hour, http_requests_hour, http_errors_hour )
+			VALUES ( UTC_TIMESTAMP(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )
+			ON DUPLICATE KEY UPDATE heap_used = VALUES( heap_used )",
+			[
+				num( r.uptimeSeconds, "integer" ), num( r.heapUsed ), num( r.heapMax ), num( r.oldGenAfterGc ), num( r.directUsed ),
+				num( r.openFiles, "integer" ), num( r.memoryFree ),
+				num( r.cpuLoadHour, "double" ), num( r.fullGcsHour, "integer" ),
+				{ value: isNull( r.fullGcCausesHour ) ? "" : jsonSerialize( r.fullGcCausesHour ), sqltype: "longvarchar", null: isNull( r.fullGcCausesHour ) },
+				num( r.gcMsHour, "integer" ), num( r.httpRequestsHour, "integer" ), num( r.httpErrorsHour, "integer" )
+			]
+		)
+	}
+
+}

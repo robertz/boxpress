@@ -1,0 +1,69 @@
+/**
+ * What authors write is untrusted: an author account must not be able to
+ * put script on the site or into an admin's browser. Rendered Markdown is
+ * cleaned once, when a post is saved, and the clean copy is what's stored
+ * and served (posts.body_html).
+ */
+class {
+
+	property name="jsoup";
+	property name="articleSafelist";
+	property name="outputSettings";
+
+	static {
+		// relative addresses (/uploads/..., #heading) are checked against this and kept relative
+		BASE_URI = "http://boxpress.invalid/"
+	}
+
+	function init( required javaLib ) {
+		variables.jsoup = arguments.javaLib.create( "org.jsoup.Jsoup" )
+
+		// What an article can hold: text formatting, headings, lists, quotes, code,
+		// tables, images and links. No script, style, forms, frames or event handlers.
+		variables.articleSafelist = arguments.javaLib.create( "org.jsoup.safety.Safelist" )
+			.init()
+			.addTags( [
+				"p", "br", "hr", "strong", "em", "b", "i", "u", "del", "s", "ins", "mark", "sub", "sup", "small", "kbd", "abbr",
+				"code", "pre", "blockquote", "ul", "ol", "li", "dl", "dt", "dd", "a", "img", "figure", "figcaption",
+				"h1", "h2", "h3", "h4", "h5", "h6", "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption",
+				"details", "summary"
+			] )
+			.addAttributes( "a", [ "href", "title" ] )
+			.addAttributes( "img", [ "src", "alt", "title", "width", "height" ] )
+			.addAttributes( "code", [ "class" ] )
+			.addAttributes( "abbr", [ "title" ] )
+			.addAttributes( "ol", [ "start" ] )
+			.addAttributes( "th", [ "align", "colspan", "rowspan" ] )
+			.addAttributes( "td", [ "align", "colspan", "rowspan" ] )
+			.addAttributes( ":all", [ "id" ] )
+			.addProtocols( "a", "href", [ "http", "https", "mailto", "##" ] )
+			.addProtocols( "img", "src", [ "http", "https" ] )
+			.preserveRelativeLinks( true )
+
+		variables.outputSettings = arguments.javaLib.create( "org.jsoup.nodes.Document$OutputSettings" )
+			.init()
+			.prettyPrint( false )
+
+		return this
+	}
+
+	/** HTML rendered from an article's Markdown, cleaned, as a jsoup body to change and then render(). */
+	function cleanArticle( string html = "" ) {
+		var cleaned = variables.jsoup.clean( arguments.html, static.BASE_URI, variables.articleSafelist, variables.outputSettings )
+		return variables.jsoup.parseBodyFragment( cleaned ).body()
+	}
+
+	string function render( required body ) {
+		arguments.body.ownerDocument().outputSettings( variables.outputSettings )
+		return arguments.body.html().trim()
+	}
+
+	/** The words alone: for excerpts, feeds and reading time. */
+	string function toText( string html = "" ) {
+		if ( !len( trim( arguments.html ) ) ) {
+			return ""
+		}
+		return variables.jsoup.parse( arguments.html ).text()
+	}
+
+}

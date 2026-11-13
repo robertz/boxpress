@@ -1,0 +1,134 @@
+/**
+ * A post's history: a snapshot each time it's saved (the latest KEEP_SAVES
+ * kept), and each editor's unsaved work in progress, an autosave the editor
+ * sends while there are unsaved changes. An autosave never changes the post;
+ * the next save replaces it.
+ */
+class {
+
+	property name="db";
+
+	static {
+		KEEP_SAVES = 30
+	}
+
+	function init( required db ) {
+		variables.db = arguments.db
+		return this
+	}
+
+	/** Records the post as it now is, unless that's what the last snapshot already holds. */
+	void function snapshot( required numeric postId, required numeric userId ) {
+		var rows = variables.db.query(
+			"SELECT p.title, p.excerpt, p.cover_image, p.body,
+				COALESCE( ( SELECT GROUP_CONCAT( t.name ORDER BY pt.position SEPARATOR ',' ) FROM post_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.post_id = p.id ), '' ) AS tag_list
+			FROM posts p WHERE p.id = ?",
+			[ arguments.postId ],
+			{ returnType: "array" }
+		)
+		if ( !rows.len() ) {
+			return
+		}
+		var post = rows[ 1 ]
+		removeAutosave( arguments.postId, arguments.userId )
+		var latest = variables.db.query(
+			"SELECT title, excerpt, cover_image, body, tags FROM post_revisions WHERE post_id = ? AND kind = 'save' ORDER BY id DESC LIMIT 1",
+			[ arguments.postId ],
+			{ returnType: "array" }
+		)
+		if ( latest.len()
+			&& compare( latest[ 1 ].title, post.title ) == 0
+			&& compare( latest[ 1 ].excerpt, post.excerpt ) == 0
+			&& compare( latest[ 1 ].cover_image ?: "", post.cover_image ?: "" ) == 0
+			&& compare( latest[ 1 ].body, post.body ) == 0
+			&& compare( latest[ 1 ].tags, post.tag_list ) == 0 ) {
+			return
+		}
+		insertRevision( arguments.postId, arguments.userId, "save", {
+			title      : post.title,
+			excerpt    : post.excerpt,
+			coverImage : post.cover_image ?: "",
+			body       : post.body,
+			tags       : post.tag_list
+		} )
+		// the derived table because MySQL won't delete from a table it's also selecting from
+		variables.db.execute(
+			"DELETE FROM post_revisions WHERE post_id = ? AND kind = 'save' AND id NOT IN (
+				SELECT id FROM ( SELECT id FROM post_revisions WHERE post_id = ? AND kind = 'save' ORDER BY id DESC LIMIT #static.KEEP_SAVES# ) AS kept
+			)",
+			[ arguments.postId, arguments.postId ]
+		)
+	}
+
+	/** Replaces this user's autosave of the post. content: { title, excerpt, coverImage, body, tags (array or list) } */
+	void function autosave( required numeric postId, required numeric userId, required struct content ) {
+		removeAutosave( arguments.postId, arguments.userId )
+		var c = arguments.content
+		insertRevision( arguments.postId, arguments.userId, "autosave", {
+			title      : textOf( c.title ?: "" ),
+			excerpt    : textOf( c.excerpt ?: "" ),
+			coverImage : textOf( c.coverImage ?: "" ),
+			body       : textOf( c.body ?: "" ),
+			tags       : isArray( c.tags ?: "" ) ? c.tags.filter( ( t ) => isSimpleValue( t ) ).toList( "," ) : textOf( c.tags ?: "" )
+		} )
+	}
+
+	/** The post's history, newest first, without the bodies: [ { id, kind, createdAt, userName, title, words } ] */
+	array function list( required numeric postId ) {
+		return variables.db.query(
+			"SELECT r.id, r.kind, DATE_FORMAT( r.created_at, '%Y-%m-%dT%H:%i:%sZ' ) AS createdAt, r.title, r.body,
+				COALESCE( NULLIF( u.display_name, '' ), u.username, '' ) AS userName
+			FROM post_revisions r LEFT JOIN users u ON u.id = r.user_id
+			WHERE r.post_id = ? ORDER BY r.id DESC LIMIT 60",
+			[ arguments.postId ],
+			{ returnType: "array" }
+		).map( ( r ) => {
+			return { id: r.id, kind: r.kind, createdAt: r.createdAt, userName: r.userName, title: r.title, words: reMatch( "\S+", r.body ).len() }
+		} )
+	}
+
+	/** One revision in full, or {} when it isn't this post's. */
+	struct function get( required numeric postId, required numeric revisionId ) {
+		var rows = variables.db.query(
+			"SELECT id, kind, DATE_FORMAT( created_at, '%Y-%m-%dT%H:%i:%sZ' ) AS createdAt, title, excerpt, cover_image, body, tags
+			FROM post_revisions WHERE id = ? AND post_id = ?",
+			[ arguments.revisionId, arguments.postId ],
+			{ returnType: "array" }
+		)
+		if ( !rows.len() ) {
+			return {}
+		}
+		var r = rows[ 1 ]
+		return {
+			id         : r.id,
+			kind       : r.kind,
+			createdAt  : r.createdAt,
+			title      : r.title,
+			excerpt    : r.excerpt,
+			coverImage : r.cover_image ?: "",
+			body       : r.body,
+			tags       : listToArray( r.tags, "," )
+		}
+	}
+
+	private void function removeAutosave( required numeric postId, required numeric userId ) {
+		variables.db.execute( "DELETE FROM post_revisions WHERE post_id = ? AND user_id = ? AND kind = 'autosave'", [ arguments.postId, arguments.userId ] )
+	}
+
+	private void function insertRevision( required numeric postId, required numeric userId, required string kind, required struct content ) {
+		var c = arguments.content
+		variables.db.execute(
+			"INSERT INTO post_revisions ( post_id, user_id, kind, title, excerpt, cover_image, body, tags ) VALUES ( ?, ?, ?, ?, ?, ?, ?, ? )",
+			[
+				arguments.postId, arguments.userId, arguments.kind, left( c.title, 255 ), left( c.excerpt, 500 ),
+				len( trim( c.coverImage ) ) ? left( c.coverImage, 1000 ) : { value: "", null: true },
+				c.body, left( c.tags, 1000 )
+			]
+		)
+	}
+
+	private string function textOf( value ) {
+		return !isNull( arguments.value ) && isSimpleValue( arguments.value ) ? toString( arguments.value ) : ""
+	}
+
+}

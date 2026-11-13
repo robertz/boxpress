@@ -1,0 +1,23 @@
+import services.ApiError;
+import routes.Http;
+
+/**
+ *   GET   /api/tags        every tag with its post count, for the editor's suggestions
+ *   PATCH /api/tags/:id    { name }: renames it (admins)
+ */
+class {
+
+	static void function register( required router, required struct svc ) {
+		var tags = arguments.svc.tags
+
+		arguments.router.get( "/tags", ( req, res ) => res.json( tags.all() ) )
+
+		arguments.router.patch( "/tags/:id", ( req, res ) => {
+			if ( !req.user.isAdmin ) {
+				ApiError::forbidden()
+			}
+			res.json( tags.rename( Http::pathId( req.params ), Http::requiredString( Http::body( req ), "name", 50 ) ) )
+		} )
+	}
+
+}

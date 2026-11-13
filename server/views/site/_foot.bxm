@@ -1,0 +1,22 @@
+<bx:output>
+</main>
+<footer class="site-footer">
+	<div class="wrap site-footer__inner">
+		<p>
+			<bx:if len( data.site.footerText )>
+				#encodeForHTML( data.site.footerText )#
+			<bx:else>
+				&copy; #year( now() )# #encodeForHTML( data.site.title )#
+			</bx:if>
+		</p>
+		<nav class="site-footer__links" aria-label="Elsewhere">
+			<a href="/feed.xml">RSS</a>
+			<a href="/tags">Tags</a>
+			<a href="/authors">Authors</a>
+			<span class="site-footer__credit">Powered by BoxPress</span>
+		</nav>
+	</div>
+</footer>
+</body>
+</html>
+</bx:output>

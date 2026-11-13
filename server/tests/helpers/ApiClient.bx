@@ -1,0 +1,134 @@
+/**
+ * A browser-ish HTTP client for the API specs: keeps cookies, remembers the
+ * CSRF token from /api/auth/session or login, and sends it on writes.
+ * Cookies are handled here rather than by java.net.CookieManager, which
+ * turns Max-Age cookies into RFC 2965 `$Version="1"; name="value"` headers
+ * that no browser sends.
+ */
+class {
+
+	property name="baseUrl" type="string";
+	property name="client";
+	property name="cookies";
+	property name="csrfToken" type="string";
+
+	function init( required string baseUrl ) {
+		variables.baseUrl   = arguments.baseUrl
+		variables.csrfToken = ""
+		variables.cookies   = {}
+		variables.client    = createObject( "java", "java.net.http.HttpClient" ).newHttpClient()
+		return this
+	}
+
+	struct function get( required string path ) {
+		return send( "GET", arguments.path )
+	}
+
+	struct function post( required string path, body = {}, struct headers = {} ) {
+		return send( "POST", arguments.path, arguments.body, arguments.headers )
+	}
+
+	struct function put( required string path, body = {} ) {
+		return send( "PUT", arguments.path, arguments.body )
+	}
+
+	struct function patch( required string path, body = {} ) {
+		return send( "PATCH", arguments.path, arguments.body )
+	}
+
+	struct function delete( required string path ) {
+		return send( "DELETE", arguments.path )
+	}
+
+	/** GET /api/auth/session, keeping the CSRF token it hands out. */
+	struct function startSession() {
+		var response = get( "/api/auth/session" )
+		variables.csrfToken = response.json.csrfToken ?: ""
+		return response
+	}
+
+	struct function login( required string username, required string password ) {
+		if ( !len( variables.csrfToken ) ) {
+			startSession()
+		}
+		var response = post( "/api/auth/login", { username: arguments.username, password: arguments.password } )
+		if ( response.status == 200 ) {
+			variables.csrfToken = response.json.csrfToken
+		}
+		return response
+	}
+
+	string function sessionCookie() {
+		return variables.cookies[ "boxpress.sid" ] ?: ""
+	}
+
+	/** Sends the cookies from another client, as if it were the same browser. */
+	void function shareCookiesFrom( required other ) {
+		variables.cookies   = duplicate( arguments.other.getCookies() )
+		variables.csrfToken = arguments.other.getCsrfToken()
+	}
+
+	/**
+	 * body: a struct/array is sent as JSON; a string is sent as-is (set
+	 * Content-Type in headers). Pass headers["X-CSRF-Token"] = "" to omit the token.
+	 */
+	struct function send( required string method, required string path, body = "", struct headers = {} ) {
+		var builder = createObject( "java", "java.net.http.HttpRequest" )
+			.newBuilder( createObject( "java", "java.net.URI" ).init( variables.baseUrl & arguments.path ) )
+		var publishers = createObject( "java", "java.net.http.HttpRequest$BodyPublishers" )
+		var payload    = ""
+		var hasBody    = !( isSimpleValue( arguments.body ) && !len( arguments.body ) )
+
+		if ( hasBody && isBinary( arguments.body ) ) {
+			payload = arguments.body
+		} else if ( hasBody && !isSimpleValue( arguments.body ) ) {
+			payload = jsonSerialize( arguments.body )
+			builder.header( "Content-Type", "application/json" )
+		} else if ( hasBody ) {
+			payload = arguments.body
+		}
+
+		var sendToken = arguments.headers.keyExists( "X-CSRF-Token" ) ? arguments.headers[ "X-CSRF-Token" ] : variables.csrfToken
+		if ( arguments.method != "GET" && len( sendToken ) ) {
+			builder.header( "X-CSRF-Token", sendToken )
+		}
+		for ( var name in arguments.headers ) {
+			if ( name != "X-CSRF-Token" ) {
+				builder.header( name, arguments.headers[ name ] )
+			}
+		}
+
+		if ( !variables.cookies.isEmpty() ) {
+			builder.header( "Cookie", variables.cookies.reduce( ( acc, name, value ) => acc.listAppend( "#name#=#value#", ";" ), "" ).replace( ";", "; ", "all" ) )
+		}
+
+		builder.method( arguments.method, !hasBody ? publishers.noBody() : isBinary( payload ) ? publishers.ofByteArray( payload ) : publishers.ofString( payload ) )
+		var response = variables.client.send( builder.build(), createObject( "java", "java.net.http.HttpResponse$BodyHandlers" ).ofString() )
+		rememberCookies( response )
+		var text     = response.body() ?: ""
+		var parsed   = {}
+		if ( len( text ) && isJSON( text ) ) {
+			parsed = jsonDeserialize( text )
+		}
+		return {
+			status  : response.statusCode(),
+			body    : text,
+			json    : parsed,
+			headers : response.headers().map()
+		}
+	}
+
+	private void function rememberCookies( required response ) {
+		for ( var line in arguments.response.headers().allValues( "set-cookie" ) ) {
+			var pair  = listFirst( line, ";" )
+			var name  = trim( listFirst( pair, "=" ) )
+			var value = listRest( pair, "=" )
+			if ( reFindNoCase( ";\s*max-age=0(;|$)", line ) || !len( value ) ) {
+				variables.cookies.delete( name )
+			} else {
+				variables.cookies[ name ] = value
+			}
+		}
+	}
+
+}

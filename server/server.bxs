@@ -1,0 +1,57 @@
+/**
+ * boxlang server.bxs   (run from the server/ directory)
+ */
+import services.Bootstrap;
+import routes.Api;
+
+settings = Bootstrap::loadSettings()
+svc      = Bootstrap::build( settings )
+
+applied = svc.migrator.run()
+if ( applied.len() ) {
+	println( "Applied migrations: #applied.toList( ', ' )#" )
+}
+
+claimed = svc.users.claimFromEnvironment( settings.auth.username, settings.auth.passwordHash, settings.auth.email )
+if ( len( claimed ) ) {
+	println( claimed )
+}
+if ( svc.users.defaultAdminActive() ) {
+	println( "[security] The default account admin / admin still works. Sign in at /admin and change its password under Account." )
+}
+if ( svc.users.count() == 0 ) {
+	println( "No accounts yet. Create the first admin with: boxlang scripts/users.bxs add <username> <email> --admin" )
+}
+
+if ( isInstanceOf( svc.storage, "services.LocalStorage" ) ) {
+	println( "[media] No S3 bucket configured: uploads go to #svc.storage.getDirectory()#" )
+}
+
+app = Api::build( svc )
+// BoxExpress's HTTP counters, for Admin > Server
+svc.monitor.attach( app )
+
+app.schedule( 60 * 60 * 1000, () => svc.sessions.prune(), { name: "session-prune", immediate: true } )
+
+// the access log, written in the background so no request waits on it (RequestLog)
+app.schedule( 5 * 1000, () => svc.requestLog.flush(), { name: "request-log", immediate: false } )
+
+// each completed day of the access log, summarized for Insights
+app.schedule( 30 * 60 * 1000, () => {
+	try {
+		var built = svc.insights.buildMissing()
+		if ( built ) {
+			println( "[insights] summarized #built# #built == 1 ? 'day' : 'days'#" )
+		}
+	} catch ( any e ) {
+		println( "[insights] summarizing failed: #e.message#" )
+	}
+}, { name: "insights-daily", immediate: true } )
+
+// an hourly record of the server, for Admin > Server's charts (ServerHistory); one at start, so a
+// restart shows and the next hour's differences have something to go from
+app.schedule( 60 * 60 * 1000, () => svc.history.record(), { name: "server-history", immediate: true } )
+
+app.listen( settings.server.port, ( port ) => {
+	println( "#settings.siteName# listening on http://localhost:#port#" )
+} )

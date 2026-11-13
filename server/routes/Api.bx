@@ -1,0 +1,219 @@
+import services.ApiError;
+
+/**
+ * Builds the BoxExpress app. server.bxs listens; the specs build the same
+ * app and listen on a test port.
+ *
+ *   /health, /api/health   open
+ *   /api/auth/*            session + CSRF, no login needed
+ *   /api/*                 session + CSRF + login, as req.user (admins and authors)
+ *   /api/admin/*           admins only
+ *   /admin, /admin/*       the admin app (web/dist/admin.html)
+ *   /uploads/*             uploaded images, when no S3 bucket is configured
+ *   everything else        the public site, rendered on the server (SiteRoutes, FeedRoutes)
+ */
+class {
+
+	/**
+	 * Second layer behind sanitizing what authors write: even if hostile
+	 * markup got through, it can't run script, load plugins or post forms
+	 * elsewhere. Images may come from anywhere over https (a post can link an
+	 * image hosted elsewhere) and from our storage. The admin app also needs
+	 * inline styles: MUI and the Markdown editor add <style> elements as they run.
+	 */
+	static string function contentSecurityPolicy( string imageOrigin = "", boolean admin = false ) {
+		return [
+			"default-src 'self'",
+			"script-src 'self'",
+			"style-src 'self'#arguments.admin ? " 'unsafe-inline'" : ""#",
+			"img-src 'self' data: blob: https:#len( arguments.imageOrigin ) ? " " & arguments.imageOrigin : ""#",
+			"connect-src 'self'",
+			"font-src 'self'",
+			"object-src 'none'",
+			"base-uri 'none'",
+			"form-action 'self'",
+			"frame-ancestors 'none'"
+		].toList( "; " )
+	}
+
+	static function build( required struct svc ) {
+		var settings   = arguments.svc.settings
+		var app        = boxExpress()
+		var production = settings.server.production ?: false
+		app.set( "log", settings.server.requestLog ?: true )
+		app.set( "env", settings.server.environment ?: "development" )
+		if ( len( settings.server.trustProxyHeader ?: "" ) ) {
+			app.set( "trust proxy header", settings.server.trustProxyHeader )
+		}
+		// first, so they time everything after them: requests by route (Server) and the access log (Insights)
+		app.use( arguments.svc.routeStats.middleware() )
+		app.use( arguments.svc.requestLog.middleware() )
+		app.use( boxExpressHelmet( {
+			contentSecurityPolicy : false,
+			frameOptions          : "DENY",
+			referrerPolicy        : "strict-origin-when-cross-origin",
+			hsts                  : production ? "max-age=15552000" : false
+		} ) )
+		var siteCsp  = contentSecurityPolicy( arguments.svc.storage.publicOrigin(), false )
+		var adminCsp = contentSecurityPolicy( arguments.svc.storage.publicOrigin(), true )
+		app.use( ( req, res, next ) => {
+			var path = req.path
+			res.set( "Content-Security-Policy", path == "/admin" || left( path, 7 ) == "/admin/" ? adminCsp : siteCsp )
+			next()
+		} )
+
+		// a request for another host goes to SITE_URL's: one address per page for search engines
+		if ( production && ( settings.server.canonicalHost ?: false ) ) {
+			var siteHost = settings.siteHost
+			var siteUrl  = settings.siteUrl
+			app.use( ( req, res, next ) => {
+				if ( req.path != "/health" && lcase( req.hostname ) != siteHost ) {
+					return res.redirect( siteUrl & req.originalUrl, 301 )
+				}
+				next()
+			} )
+		}
+
+		app.get( "/health", ( req, res ) => res.send( "ok" ) )
+
+		var db       = arguments.svc.db
+		var migrator = arguments.svc.migrator
+		app.get( "/api/health", ( req, res ) => {
+			try {
+				db.query( "SELECT 1" )
+				res.json( { status: "ok", schemaVersion: migrator.currentVersion() } )
+			} catch ( any e ) {
+				res.status( 503 ).json( { status: "error", error: true, code: "unavailable", message: "Database unavailable" } )
+			}
+		} )
+
+		var sessions = boxExpressSession( {
+			name              : "boxpress.sid",
+			maxAge            : ( settings.auth.sessionDays ?: 30 ) * 86400,
+			store             : arguments.svc.sessions,
+			resave            : false,
+			saveUninitialized : false,
+			secure            : production,
+			sameSite          : "Lax"
+		} )
+		// a malformed body is a 400, sent by boxExpressJSON itself
+		var jsonBody = boxExpressJSON( { limit: 2 * 1024 * 1024 } )
+
+		var api = boxExpressRouter()
+		api.use( sessions, jsonBody, boxExpressCsrf() )
+		AuthRoutes::register( api, arguments.svc )
+		api.use( AuthRoutes::requireLogin( arguments.svc.users, arguments.svc.passkeys ) )
+		AuthRoutes::registerAccount( api, arguments.svc )
+		DashboardRoutes::register( api, arguments.svc )
+		PostRoutes::register( api, arguments.svc )
+		TagRoutes::register( api, arguments.svc )
+		MediaRoutes::register( api, arguments.svc )
+		// admin routes last: requireAdmin applies to everything registered after it
+		api.use( "/admin", AuthRoutes::requireAdmin() )
+		AdminRoutes::register( api, arguments.svc )
+		app.use( "/api", api )
+
+		app.all( "/api/*", ( req, res ) => {
+			ApiError::notFound( "No such endpoint: #req.method# #req.path#" )
+		} )
+
+		// images on local disk, when no bucket is configured
+		if ( isInstanceOf( arguments.svc.storage, "services.LocalStorage" ) ) {
+			var uploadsDir = arguments.svc.storage.getDirectory()
+			if ( !directoryExists( uploadsDir ) ) {
+				directoryCreate( uploadsDir, true )
+			}
+			app.use( "/uploads", boxExpressStatic( uploadsDir, { maxAge: 31536000 } ) )
+		}
+
+		var webRoot = webRootOf( settings )
+		serveAdmin( app, webRoot )
+		// Vite names these files for their content, so they can be cached for a year
+		if ( directoryExists( webRoot & "/assets" ) ) {
+			app.use( "/assets", boxExpressStatic( webRoot & "/assets", { maxAge: 31536000, immutable: true } ) )
+		}
+		app.use( boxExpressStatic( expandPath( getDirectoryFromPath( getCurrentTemplatePath() ) & "../public" ), { maxAge: 86400 } ) )
+
+		app.set( "views", expandPath( getDirectoryFromPath( getCurrentTemplatePath() ) & "../views" ) )
+		var assets = SiteRoutes::assetsOf( webRoot )
+		app.locals.siteCss = assets.css
+		app.locals.siteJs  = assets.js
+		FeedRoutes::register( app, arguments.svc )
+		SiteRoutes::register( app, arguments.svc )
+
+		app.use( errorHandler( ( settings.server.environment ?: "" ) == "development", arguments.svc ) )
+		return app
+	}
+
+	static string function webRootOf( required struct settings ) {
+		return len( arguments.settings.server.webRoot ?: "" ) ? arguments.settings.server.webRoot : expandPath( getDirectoryFromPath( getCurrentTemplatePath() ) & "../../web/dist" )
+	}
+
+	/**
+	 * The admin is a single-page app: every /admin address gets admin.html, and
+	 * the app's router takes it from there. It must not be cached, or a deploy
+	 * is invisible until it expires. In development Vite serves it instead.
+	 */
+	private static void function serveAdmin( required app, required string webRoot ) {
+		var indexFile = arguments.webRoot & "/admin.html"
+		if ( !fileExists( indexFile ) ) {
+			println( "[web] #arguments.webRoot# has no build; run `npm run build` in web/ (or `npm run dev` and open http://localhost:5173/admin)" )
+			arguments.app.get( "/admin", ( req, res ) => {
+				res.status( 503 ).type( "text/plain" ).send( "The admin app isn't built. Run `npm run build` in web/." )
+			} )
+			return
+		}
+		var sendIndex = ( req, res ) => {
+			res.set( "Cache-Control", "no-cache" ).sendFile( indexFile )
+		}
+		arguments.app.get( "/admin", sendIndex )
+		arguments.app.get( "/admin/*", sendIndex )
+	}
+
+	/**
+	 * /api errors leave as { error: true, code, message }, the same shape
+	 * BoxExpress's own 403/413 responses use; anywhere else they're the site's
+	 * own error page.
+	 */
+	private static function errorHandler( required boolean development, required struct svc ) {
+		var showInternals = arguments.development
+		var site = arguments.svc.site
+		var siteUrl = arguments.svc.settings.siteUrl
+		return ( err, req, res, next ) => {
+			var type    = err.type ?: ""
+			var status  = ApiError::statusFor( type )
+			var message = err.message ?: "Error"
+			if ( status == 500 ) {
+				println( "[error] #req.method# #req.path# failed: #type# #message#" )
+			}
+			if ( left( req.path, 5 ) == "/api/" ) {
+				var payload = { error: true, code: type == "Api.PasskeyRequired" ? "passkey_required" : ApiError::codeFor( status ), message: message }
+				if ( ( status == 409 || status == 422 ) && len( err.extendedInfo ?: "" ) && isJSON( err.extendedInfo ) ) {
+					payload.append( jsonDeserialize( err.extendedInfo ) )
+				}
+				if ( status == 500 ) {
+					payload.message = showInternals ? message : "Internal Server Error"
+				}
+				return res.status( status ).json( payload )
+			}
+			var page = status == 404 ? "site/404" : "site/error"
+			try {
+				res.status( status == 404 ? 404 : 500 ).render( page, {
+					site         : site.all(),
+					siteUrl      : siteUrl,
+					currentPath  : req.path,
+					canonicalUrl : siteUrl & req.path,
+					description  : "",
+					ogType       : "website",
+					ogImage      : "",
+					robots       : "noindex",
+					pageTitle    : status == 404 ? "Page not found" : "Something went wrong",
+					detail       : showInternals && status == 500 ? message : ""
+				} )
+			} catch ( any e ) {
+				res.status( 500 ).type( "text/plain" ).send( "Something went wrong" )
+			}
+		}
+	}
+
+}

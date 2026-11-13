@@ -1,0 +1,21 @@
+/**
+ * Creates objects from the jars in server/lib (jsoup) without needing
+ * them on the JVM classpath.
+ */
+class {
+
+	property name="paths" type="array";
+
+	function init( string libDirectory = expandPath( getDirectoryFromPath( getCurrentTemplatePath() ) & "../lib" ) ) {
+		variables.paths = directoryList( arguments.libDirectory, false, "path", "*.jar" )
+		if ( !variables.paths.len() ) {
+			throw( type = "JavaLib.MissingJars", message = "No jars found in #arguments.libDirectory#" )
+		}
+		return this
+	}
+
+	function create( required string className ) {
+		return createObject( "java", arguments.className, variables.paths )
+	}
+
+}

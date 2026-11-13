@@ -1,0 +1,56 @@
+/**
+ * A BoxExpress session store (get/set/destroy) in MySQL, so a restart does
+ * not log you out. Ids are stored hashed: a leaked table holds no usable
+ * session cookies. Sessions without a logged-in user expire after an hour
+ * whatever maxAge says, so cookieless traffic can't pile up rows.
+ */
+class {
+
+	property name="db";
+
+	static {
+		ANONYMOUS_SECONDS = 3600
+	}
+
+	function init( required db ) {
+		variables.db = arguments.db
+		return this
+	}
+
+	function get( required string sessionId ) {
+		var q = variables.db.query(
+			"SELECT data FROM sessions WHERE id_hash = ? AND expires_at > UTC_TIMESTAMP()",
+			[ idHash( arguments.sessionId ) ]
+		)
+		if ( !q.recordCount ) {
+			return javacast( "null", "" )
+		}
+		try {
+			return jsonDeserialize( q.data )
+		} catch ( any e ) {
+			return javacast( "null", "" )
+		}
+	}
+
+	void function set( required string sessionId, required struct data, required numeric maxAge ) {
+		var seconds = len( arguments.data.userId ?: "" ) ? arguments.maxAge : min( arguments.maxAge, static.ANONYMOUS_SECONDS )
+		variables.db.execute(
+			"INSERT INTO sessions ( id_hash, data, expires_at ) VALUES ( ?, ?, DATE_ADD( UTC_TIMESTAMP(), INTERVAL ? SECOND ) ) AS incoming
+			ON DUPLICATE KEY UPDATE data = incoming.data, expires_at = incoming.expires_at",
+			[ idHash( arguments.sessionId ), jsonSerialize( arguments.data ), { value: int( seconds ), sqltype: "integer" } ]
+		)
+	}
+
+	void function destroy( required string sessionId ) {
+		variables.db.execute( "DELETE FROM sessions WHERE id_hash = ?", [ idHash( arguments.sessionId ) ] )
+	}
+
+	numeric function prune() {
+		return variables.db.execute( "DELETE FROM sessions WHERE expires_at <= UTC_TIMESTAMP()" ).recordCount
+	}
+
+	private string function idHash( required string sessionId ) {
+		return hash( arguments.sessionId, "SHA-256" ).lcase()
+	}
+
+}

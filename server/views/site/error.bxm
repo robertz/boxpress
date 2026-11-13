@@ -1,0 +1,10 @@
+<bx:include template="_head.bxm">
+<bx:output>
+<div class="wrap wrap--narrow notice">
+	<h1 class="page-header__title">Something went wrong</h1>
+	<p>The page couldn't be shown just now. Try again in a moment.</p>
+	<bx:if len( data.detail ?: "" )><pre class="notice__detail">#encodeForHTML( data.detail )#</pre></bx:if>
+	<p><a href="/">Go to the latest posts</a></p>
+</div>
+</bx:output>
+<bx:include template="_foot.bxm">

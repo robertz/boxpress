@@ -1,0 +1,18 @@
+{
+	"defaultDatasource": "boxpress",
+	"datasources": {
+		"boxpress": {
+			"driver": "mysql",
+			"host": "${env.BOXPRESS_DB_HOST:127.0.0.1}",
+			"port": "${env.BOXPRESS_DB_PORT:3306}",
+			"database": "${env.BOXPRESS_DB_NAME:boxpress_development}",
+			"username": "${env.BOXPRESS_DB_USER:root}",
+			"password": "${env.BOXPRESS_DB_PASSWORD}",
+			"useServerPrepStmts": false,
+			"cachePrepStmts": false,
+			"cacheResultSetMetadata": false,
+			"maxConnections": 20,
+			"custom": "connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true"
+		}
+	}
+}

@@ -1,0 +1,207 @@
+import services.ImageMetadata;
+
+/**
+ * The media library: images authors upload for covers and post bodies. An
+ * upload must prove to be a JPEG, PNG, GIF or WebP by its first bytes,
+ * whatever its Content-Type says, loses its metadata (EXIF location, camera)
+ * on the way in (ImageMetadata), and is stored under a key of the server's
+ * choosing in the configured storage (S3Storage or LocalStorage).
+ */
+class {
+
+	property name="db";
+	property name="storage";
+	property name="settings";
+
+	static {
+		// a decoded 40-megapixel image is ~160MB
+		MAX_PIXELS = 40000000
+		EXTENSIONS = { "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp" }
+		COLUMNS = "m.id, m.owner_id, m.storage_key, m.url, m.content_type, m.width, m.height, m.bytes, m.alt_text, m.original_name, m.created_at"
+	}
+
+	/** settings: { maxBytes, prefix } */
+	function init( required db, required storage, required struct settings ) {
+		variables.db       = arguments.db
+		variables.storage  = arguments.storage
+		variables.settings = arguments.settings
+		return this
+	}
+
+	/** Stores the image and answers its view. Throws Media.Invalid, or S3Storage.Error when storage fails. */
+	struct function upload( required numeric ownerId, required bytes, string fileName = "" ) {
+		var size = arrayLen( arguments.bytes )
+		if ( size == 0 ) {
+			throw( type = "Media.Invalid", message = "That file is empty" )
+		}
+		if ( size > variables.settings.maxBytes ) {
+			throw( type = "Media.Invalid", message = "Images are at most #int( variables.settings.maxBytes / 1048576 )#MB" )
+		}
+		var type = sniff( arguments.bytes )
+		if ( !len( type ) ) {
+			throw( type = "Media.Invalid", message = "Only JPEG, PNG, GIF and WebP images can be uploaded" )
+		}
+		var cleaned = ImageMetadata::strip( arguments.bytes, type )
+		var size2d = dimensions( cleaned, type )
+		if ( size2d.width < 1 || size2d.height < 1 ) {
+			throw( type = "Media.Invalid", message = "That image couldn't be read" )
+		}
+		if ( size2d.width * size2d.height > static.MAX_PIXELS ) {
+			throw( type = "Media.Invalid", message = "That image is too large" )
+		}
+		var now = createObject( "java", "java.time.LocalDate" ).now()
+		var key = "#variables.settings.prefix#/#now.getYear()#/#right( "0" & now.getMonthValue(), 2 )#/"
+			& lcase( replace( createUUID(), "-", "", "all" ) ) & "." & static.EXTENSIONS[ type ]
+		variables.storage.putObject( key, cleaned, type, "public, max-age=31536000, immutable" )
+		var id = variables.db.execute(
+			"INSERT INTO media ( owner_id, storage_key, url, content_type, width, height, bytes, original_name ) VALUES ( ?, ?, ?, ?, ?, ?, ?, ? )",
+			[ arguments.ownerId, key, variables.storage.publicUrl( key ), type, size2d.width, size2d.height, arrayLen( cleaned ), left( trim( arguments.fileName ), 255 ) ]
+		).generatedKey
+		return view( row( id ) )
+	}
+
+	/** { items, total, page, pageSize }, newest first. ownerId 0 lists everyone's. */
+	struct function list( numeric page = 1, numeric pageSize = 48, numeric ownerId = 0, string search = "" ) {
+		var where  = [ "1 = 1" ]
+		var params = []
+		if ( arguments.ownerId ) {
+			where.append( "m.owner_id = ?" )
+			params.append( arguments.ownerId )
+		}
+		if ( len( trim( arguments.search ) ) ) {
+			where.append( "( m.original_name LIKE ? OR m.alt_text LIKE ? )" )
+			params.append( "%" & trim( arguments.search ) & "%" )
+			params.append( "%" & trim( arguments.search ) & "%" )
+		}
+		var whereSql = where.toList( " AND " )
+		var total = variables.db.query( "SELECT COUNT(*) AS n FROM media m WHERE #whereSql#", params ).n
+		var rows = variables.db.query(
+			"SELECT #static.COLUMNS#, u.display_name AS owner_name FROM media m JOIN users u ON u.id = m.owner_id
+			WHERE #whereSql# ORDER BY m.id DESC LIMIT #int( arguments.pageSize )# OFFSET #int( ( arguments.page - 1 ) * arguments.pageSize )#",
+			params,
+			{ returnType: "array" }
+		)
+		return { items: rows.map( ( r ) => view( r ) ), total: total, page: arguments.page, pageSize: arguments.pageSize }
+	}
+
+	/** The row, or {} when there's no such image. */
+	struct function get( required numeric id ) {
+		return row( arguments.id )
+	}
+
+	struct function setAlt( required numeric id, required string altText ) {
+		variables.db.execute( "UPDATE media SET alt_text = ? WHERE id = ?", [ left( trim( arguments.altText ), 500 ), arguments.id ] )
+		return view( row( arguments.id ) )
+	}
+
+	/** Removes the file and its row. A post that still shows it keeps a broken image, so the admin asks first. */
+	void function remove( required numeric id ) {
+		var found = row( arguments.id )
+		if ( found.isEmpty() ) {
+			return
+		}
+		variables.storage.deleteObject( found.storage_key )
+		variables.db.execute( "DELETE FROM media WHERE id = ?", [ arguments.id ] )
+	}
+
+	/** How many posts mention this image's address, in their body or as their cover. */
+	numeric function usage( required string address ) {
+		return variables.db.query(
+			"SELECT COUNT(*) AS n FROM posts WHERE cover_image = ? OR LOCATE( ?, body ) > 0",
+			[ arguments.address, arguments.address ]
+		).n
+	}
+
+	struct function totals() {
+		return variables.db.query( "SELECT COUNT(*) AS files, COALESCE( SUM( bytes ), 0 ) AS bytes FROM media", [], { returnType: "array" } )[ 1 ]
+	}
+
+	struct function view( required struct row ) {
+		return {
+			id           : arguments.row.id,
+			url          : arguments.row.url,
+			width        : arguments.row.width,
+			height       : arguments.row.height,
+			bytes        : arguments.row.bytes,
+			contentType  : arguments.row.content_type,
+			alt          : arguments.row.alt_text ?: "",
+			name         : arguments.row.original_name ?: "",
+			ownerId      : arguments.row.owner_id,
+			ownerName    : arguments.row.owner_name ?: "",
+			createdAt    : isDate( arguments.row.created_at ?: "" ) ? dateTimeFormat( arguments.row.created_at, "yyyy-mm-dd'T'HH:nn:ss'Z'" ) : ""
+		}
+	}
+
+	private struct function row( required id ) {
+		var rows = variables.db.query(
+			"SELECT #static.COLUMNS#, u.display_name AS owner_name FROM media m JOIN users u ON u.id = m.owner_id WHERE m.id = ?",
+			[ arguments.id ],
+			{ returnType: "array" }
+		)
+		return rows.len() ? rows[ 1 ] : {}
+	}
+
+	/** The image type from its signature, or "". */
+	private string function sniff( required bytes ) {
+		var data = arguments.bytes
+		var b = ( i ) => arrayLen( data ) >= i ? bitAnd( data[ i ], 255 ) : -1
+		if ( b( 1 ) == 255 && b( 2 ) == 216 && b( 3 ) == 255 ) {
+			return "image/jpeg"
+		}
+		if ( b( 1 ) == 137 && b( 2 ) == 80 && b( 3 ) == 78 && b( 4 ) == 71 && b( 5 ) == 13 && b( 6 ) == 10 && b( 7 ) == 26 && b( 8 ) == 10 ) {
+			return "image/png"
+		}
+		if ( b( 1 ) == 71 && b( 2 ) == 73 && b( 3 ) == 70 && b( 4 ) == 56 ) {
+			return "image/gif"
+		}
+		if ( b( 1 ) == 82 && b( 2 ) == 73 && b( 3 ) == 70 && b( 4 ) == 70 && b( 9 ) == 87 && b( 10 ) == 69 && b( 11 ) == 66 && b( 12 ) == 80 ) {
+			return "image/webp"
+		}
+		return ""
+	}
+
+	/** { width, height } read from the header, without decoding the pixels. */
+	private struct function dimensions( required bytes, required string type ) {
+		if ( arguments.type == "image/webp" ) {
+			return webpDimensions( arguments.bytes )
+		}
+		var imageIO = createObject( "java", "javax.imageio.ImageIO" )
+		var input = imageIO.createImageInputStream( createObject( "java", "java.io.ByteArrayInputStream" ).init( arguments.bytes ) )
+		try {
+			var readers = imageIO.getImageReaders( input )
+			if ( !readers.hasNext() ) {
+				return { width: 0, height: 0 }
+			}
+			var reader = readers.next()
+			try {
+				reader.setInput( input, true, true )
+				return { width: reader.getWidth( 0 ), height: reader.getHeight( 0 ) }
+			} catch ( any e ) {
+				return { width: 0, height: 0 }
+			} finally {
+				reader.dispose()
+			}
+		} finally {
+			input.close()
+		}
+	}
+
+	/** WebP's three layouts: lossy VP8, lossless VP8L, extended VP8X. */
+	private struct function webpDimensions( required bytes ) {
+		var data = arguments.bytes
+		var u = ( i ) => arrayLen( data ) >= i ? bitAnd( data[ i ], 255 ) : 0
+		var chunk = char( u( 13 ) ) & char( u( 14 ) ) & char( u( 15 ) ) & char( u( 16 ) )
+		if ( chunk == "VP8 " ) {
+			return { width: bitAnd( u( 27 ) + u( 28 ) * 256, 16383 ), height: bitAnd( u( 29 ) + u( 30 ) * 256, 16383 ) }
+		}
+		if ( chunk == "VP8L" ) {
+			var bits = u( 22 ) + u( 23 ) * 256 + u( 24 ) * 65536 + u( 25 ) * 16777216
+			return { width: bitAnd( bits, 16383 ) + 1, height: bitAnd( int( bits / 16384 ), 16383 ) + 1 }
+		}
+		if ( chunk == "VP8X" ) {
+			return { width: u( 25 ) + u( 26 ) * 256 + u( 27 ) * 65536 + 1, height: u( 28 ) + u( 29 ) * 256 + u( 30 ) * 65536 + 1 }
+		}
+		return { width: 0, height: 0 }
+	}
+
+}

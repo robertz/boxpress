@@ -1,0 +1,72 @@
+/**
+ * The default storage when no S3-compatible bucket is configured: objects are
+ * files under a directory the app serves at /uploads, addressed by path
+ * (publicBaseUrl "/uploads") so they load from whatever host the app is on,
+ * Vite's dev server included. In Docker the directory is a volume
+ * (production/docker-compose.yml), so uploads survive a rebuild.
+ */
+class {
+
+	property name="directory" type="string";
+	property name="publicBaseUrl" type="string";
+
+	function init( required string directory, required string publicBaseUrl ) {
+		variables.directory     = reReplace( arguments.directory, "/+$", "" )
+		variables.publicBaseUrl = reReplace( arguments.publicBaseUrl, "/+$", "" )
+		return this
+	}
+
+	boolean function isConfigured() {
+		return true
+	}
+
+	/** "": these addresses are relative, so they come from the page's own origin. */
+	string function publicOrigin() {
+		return ""
+	}
+
+	string function publicUrl( required string key ) {
+		return variables.publicBaseUrl & "/" & arguments.key
+	}
+
+	void function putObject( required string key, required body, required string contentType, string cacheControl = "" ) {
+		var path = pathOf( arguments.key )
+		var folder = getDirectoryFromPath( path )
+		if ( !directoryExists( folder ) ) {
+			directoryCreate( folder, true )
+		}
+		fileWrite( path, arguments.body )
+	}
+
+	void function deleteObject( required string key ) {
+		var path = pathOf( arguments.key )
+		if ( fileExists( path ) ) {
+			fileDelete( path )
+		}
+	}
+
+	function getObject( required string key ) {
+		return fileReadBinary( pathOf( arguments.key ) )
+	}
+
+	array function listKeys( required string prefix ) {
+		var base = variables.directory & "/"
+		if ( !directoryExists( base & arguments.prefix ) ) {
+			return []
+		}
+		return directoryList( base & arguments.prefix, true, "path", "", "", "file" ).map( ( path ) => mid( path, len( base ) + 1, len( path ) ) )
+	}
+
+	string function getDirectory() {
+		return variables.directory
+	}
+
+	/** Keys are the server's own (Media.storageKey), but never let one climb out of the directory. */
+	private string function pathOf( required string key ) {
+		if ( find( "..", arguments.key ) || left( arguments.key, 1 ) == "/" ) {
+			throw( type = "S3Storage.Error", message = "Bad key #arguments.key#" )
+		}
+		return variables.directory & "/" & arguments.key
+	}
+
+}

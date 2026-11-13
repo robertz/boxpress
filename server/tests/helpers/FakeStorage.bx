@@ -1,0 +1,59 @@
+/** Stands in for S3Storage: keeps objects in memory, and can be told to fail. */
+class {
+
+	property name="objects" type="struct";
+	property name="failing" type="boolean";
+
+	function init() {
+		variables.objects = {}
+		variables.failing = false
+		return this
+	}
+
+	boolean function isConfigured() {
+		return true
+	}
+
+	string function publicOrigin() {
+		return "https://cdn.example"
+	}
+
+	string function publicUrl( required string key ) {
+		return "https://cdn.example/" & arguments.key
+	}
+
+	void function putObject( required string key, required body, required string contentType, string cacheControl = "" ) {
+		if ( variables.failing ) {
+			throw( type: "S3Storage.Error", message: "failing" )
+		}
+		variables.objects[ arguments.key ] = { body: arguments.body, contentType: arguments.contentType, cacheControl: arguments.cacheControl }
+	}
+
+	void function deleteObject( required string key ) {
+		if ( variables.failing ) {
+			throw( type: "S3Storage.Error", message: "failing" )
+		}
+		variables.objects.delete( arguments.key )
+	}
+
+	function getObject( required string key ) {
+		if ( !variables.objects.keyExists( arguments.key ) ) {
+			throw( type: "S3Storage.Error", message: "No #arguments.key#" )
+		}
+		return variables.objects[ arguments.key ].body
+	}
+
+	array function listKeys( required string prefix ) {
+		var prefix = arguments.prefix
+		return variables.objects.keyArray().filter( ( key ) => left( key, len( prefix ) ) == prefix )
+	}
+
+	struct function getObjects() {
+		return variables.objects
+	}
+
+	void function setFailing( required boolean failing ) {
+		variables.failing = arguments.failing
+	}
+
+}

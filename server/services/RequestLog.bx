@@ -1,0 +1,195 @@
+/**
+ * An access log in the request_log table, for Insights and Admin > Requests.
+ *
+ * Nothing in the middleware touches the database: each request appends a
+ * struct to an in-memory queue (lock-free, safe for many threads) and
+ * flush(), scheduled every few seconds by server.bxs, writes them in the
+ * background. A slow or unreachable database delays the log, never a
+ * response; past MAX_QUEUE the newest rows are dropped instead of growing
+ * without bound.
+ *
+ * Static files (/assets, /uploads), health checks and the admin's own
+ * polling aren't logged: they'd drown out the requests worth reading. No IP
+ * addresses are kept.
+ */
+class {
+
+	property name="db";
+	property name="bots";
+	property name="keepDays" type="numeric";
+	property name="queue";
+	property name="flushes" type="numeric";
+
+	static {
+		MAX_QUEUE = 5000
+		MAX_BATCH = 500
+		// prune old rows every this many flushes (about half an hour at five seconds)
+		PRUNE_EVERY = 360
+		SKIP = "^/(assets|uploads)/|^/(health|favicon\.ico|api/health|api/admin/server)$"
+	}
+
+	function init( required db, required bots, numeric keepDays = 90 ) {
+		variables.db       = arguments.db
+		variables.bots     = arguments.bots
+		variables.keepDays = arguments.keepDays
+		variables.queue    = createObject( "java", "java.util.concurrent.ConcurrentLinkedQueue" ).init()
+		variables.flushes  = 0
+		return this
+	}
+
+	/** For app.use(), early, so next() covers everything after it. */
+	function middleware() {
+		var log = this
+		return ( req, res, next ) => {
+			var started = getTickCount()
+			// read now: a mounted router (app.use( "/api", api )) takes its prefix off req.path while it runs
+			var path = req.path
+			try {
+				next()
+			} finally {
+				log.enqueue( req, res, getTickCount() - started, path )
+			}
+		}
+	}
+
+	/** Never throws: a logging bug mustn't become a failed request. */
+	void function enqueue( required req, required res, required numeric durationMs, required string path ) {
+		try {
+			if ( reFind( static.SKIP, arguments.path ) || variables.queue.size() >= static.MAX_QUEUE ) {
+				return
+			}
+			var original = arguments.req.originalUrl ?: ""
+			var mark = find( "?", original )
+			variables.queue.add( {
+				requestedAt : utcNow(),
+				method      : left( arguments.req.method, 10 ),
+				path        : left( arguments.path, 2048 ),
+				queryString : mark ? mid( original, mark + 1, len( original ) ) : "",
+				statusCode  : statusOf( arguments.res ),
+				durationMs  : int( arguments.durationMs ),
+				referrer    : arguments.req.get( "Referer" ) ?: "",
+				userAgent   : arguments.req.get( "User-Agent" ) ?: ""
+			} )
+		} catch ( any e ) {
+		}
+	}
+
+	/** Writes what's queued (at most MAX_BATCH). @return how many rows */
+	numeric function flush() {
+		var written = 0
+		try {
+			var entry = variables.queue.poll()
+			while ( !isNull( entry ) ) {
+				var referrerHost = len( entry.referrer )
+					? lcase( left( reReplace( entry.referrer, "^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?##:]+).*$", "\1" ), 255 ) )
+					: ""
+				variables.db.execute(
+					"INSERT INTO request_log ( requested_at, method, path, query_string, status_code, duration_ms, referrer, referrer_host, user_agent, is_bot )
+					VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )",
+					[
+						entry.requestedAt, entry.method, entry.path, entry.queryString,
+						isNumeric( entry.statusCode ) ? entry.statusCode : { value: "", sqltype: "integer", null: true },
+						entry.durationMs, entry.referrer, referrerHost, entry.userAgent,
+						variables.bots.isBot( entry.userAgent ) ? 1 : 0
+					]
+				)
+				written++
+				if ( written >= static.MAX_BATCH ) {
+					break
+				}
+				entry = variables.queue.poll()
+			}
+			variables.flushes++
+			if ( variables.flushes >= static.PRUNE_EVERY ) {
+				variables.flushes = 0
+				prune()
+			}
+		} catch ( any e ) {
+			println( "[requests] flush failed: #e.message#" )
+		}
+		return written
+	}
+
+	numeric function prune() {
+		return variables.db.execute(
+			"DELETE FROM request_log WHERE requested_at < DATE_SUB( UTC_TIMESTAMP(), INTERVAL ? DAY )",
+			[ { value: variables.keepDays, sqltype: "integer" } ]
+		).recordCount
+	}
+
+	/**
+	 * The raw log, newest first, for Admin > Requests. Pages by id (keyset) and
+	 * never counts the table. filters: { path (prefix), method, status (2xx..5xx) }.
+	 * @return { rows, hasNewer, hasOlder, newerCursor, olderCursor }
+	 */
+	struct function recent( struct filters = {}, numeric beforeId = 0, numeric afterId = 0, numeric pageSize = 50 ) {
+		var clauses = [ "1 = 1" ]
+		var params  = []
+		var pathPrefix = trim( arguments.filters.path ?: "" )
+		if ( len( pathPrefix ) ) {
+			clauses.append( "path LIKE ?" )
+			params.append( pathPrefix.replace( "\", "\\", "all" ).replace( "%", "\%", "all" ).replace( "_", "\_", "all" ) & "%" )
+		}
+		if ( len( arguments.filters.method ?: "" ) ) {
+			clauses.append( "method = ?" )
+			params.append( arguments.filters.method )
+		}
+		if ( reFind( "^[2-5]xx$", arguments.filters.status ?: "" ) ) {
+			var floor = val( left( arguments.filters.status, 1 ) ) * 100
+			clauses.append( "status_code >= ? AND status_code < ?" )
+			params.append( floor )
+			params.append( floor + 100 )
+		}
+		var goingNewer = arguments.afterId > 0
+		if ( goingNewer || arguments.beforeId > 0 ) {
+			clauses.append( goingNewer ? "id > ?" : "id < ?" )
+			params.append( goingNewer ? arguments.afterId : arguments.beforeId )
+		}
+		var rows = variables.db.query(
+			"SELECT id, DATE_FORMAT( requested_at, '%Y-%m-%dT%H:%i:%sZ' ) AS requestedAt, method, path, query_string AS queryString,
+				status_code AS statusCode, duration_ms AS durationMs, referrer, user_agent AS userAgent, is_bot AS isBot
+			FROM request_log WHERE #clauses.toList( ' AND ' )#
+			ORDER BY id #goingNewer ? 'ASC' : 'DESC'# LIMIT #int( arguments.pageSize ) + 1#",
+			params,
+			{ returnType: "array" }
+		)
+		var hasMore = rows.len() > arguments.pageSize
+		if ( hasMore ) {
+			rows.deleteAt( rows.len() )
+		}
+		if ( goingNewer ) {
+			rows = rows.reverse()
+		}
+		for ( var r in rows ) {
+			r.isBot = r.isBot == 1
+			r.statusCode = isNumeric( r.statusCode ?: "" ) ? r.statusCode : javacast( "null", "" )
+		}
+		return {
+			rows        : rows,
+			hasNewer    : goingNewer ? hasMore : arguments.beforeId > 0,
+			hasOlder    : goingNewer ? true : hasMore,
+			newerCursor : rows.len() ? rows[ 1 ].id : 0,
+			olderCursor : rows.len() ? rows[ rows.len() ].id : 0
+		}
+	}
+
+	numeric function queued() {
+		return variables.queue.size()
+	}
+
+	private function statusOf( required res ) {
+		try {
+			return arguments.res.getStatusCode()
+		} catch ( any e ) {
+			return ""
+		}
+	}
+
+	private string function utcNow() {
+		return createObject( "java", "java.time.format.DateTimeFormatter" )
+			.ofPattern( "yyyy-MM-dd HH:mm:ss.SSS" )
+			.withZone( createObject( "java", "java.time.ZoneOffset" ).UTC )
+			.format( createObject( "java", "java.time.Instant" ).now() )
+	}
+
+}

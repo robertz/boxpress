@@ -1,0 +1,547 @@
+/**
+ * Posts: what the public site shows and what authors edit in the admin.
+ *
+ * A post is public when it's published and its published_at has passed; a
+ * published post with a future published_at is scheduled, and goes live on
+ * its own when that time comes (every public query checks the time). An
+ * author may edit only their own posts; an admin, anyone's.
+ *
+ * Times are UTC in the database and leave here as ISO 8601 strings made by
+ * MySQL (DATE_FORMAT), so the JVM's own timezone never shifts them.
+ */
+class {
+
+	property name="db";
+	property name="markdown";
+	property name="tags";
+	property name="revisions";
+	property name="users";
+	property name="siteHost" type="string";
+
+	static {
+		PUBLIC = "p.status = 'published' AND p.published_at <= UTC_TIMESTAMP()"
+		ISO = "'%Y-%m-%dT%H:%i:%sZ'"
+		COLUMNS = "p.id, p.author_id, p.title, p.slug, p.excerpt, p.cover_image, p.status, p.featured, p.reading_minutes,
+			DATE_FORMAT( p.published_at, '%Y-%m-%dT%H:%i:%sZ' ) AS published_iso,
+			DATE_FORMAT( p.created_at, '%Y-%m-%dT%H:%i:%sZ' ) AS created_iso,
+			DATE_FORMAT( p.updated_at, '%Y-%m-%dT%H:%i:%sZ' ) AS updated_iso,
+			( p.status = 'published' AND p.published_at > UTC_TIMESTAMP() ) AS scheduled,
+			u.username AS author_username, u.display_name AS author_display_name, u.bio AS author_bio,
+			u.avatar_url AS author_avatar_url, u.website AS author_website"
+		MAX_TITLE = 255
+		MAX_EXCERPT = 500
+		MAX_BODY = 1000000
+		AUTO_EXCERPT = 220
+		STATUSES = "draft,published"
+	}
+
+	function init( required db, required markdown, required tags, required revisions, required users, string siteHost = "" ) {
+		variables.db        = arguments.db
+		variables.markdown  = arguments.markdown
+		variables.tags      = arguments.tags
+		variables.revisions = arguments.revisions
+		variables.users     = arguments.users
+		variables.siteHost  = arguments.siteHost
+		return this
+	}
+
+	// ── The public site ──────────────────────────────────────────────────────
+
+	/**
+	 * A page of public posts, newest first: { posts, total, page, pageSize, totalPages }.
+	 * filter: { tagId?, authorId? }
+	 */
+	struct function publicPage( numeric page = 1, numeric pageSize = 10, struct filter = {} ) {
+		var where  = [ static.PUBLIC ]
+		var params = []
+		if ( val( arguments.filter.tagId ?: 0 ) ) {
+			where.append( "EXISTS ( SELECT 1 FROM post_tags pt WHERE pt.post_id = p.id AND pt.tag_id = ? )" )
+			params.append( arguments.filter.tagId )
+		}
+		if ( val( arguments.filter.authorId ?: 0 ) ) {
+			where.append( "p.author_id = ?" )
+			params.append( arguments.filter.authorId )
+		}
+		return paged( where.toList( " AND " ), params, "p.published_at DESC, p.id DESC", arguments.page, arguments.pageSize )
+	}
+
+	/** The public post with this slug, with its HTML; {} when there's none (or it isn't public yet). */
+	struct function publicBySlug( required string slug ) {
+		var rows = variables.db.query(
+			"SELECT #static.COLUMNS#, p.body_html FROM posts p JOIN users u ON u.id = p.author_id WHERE p.slug = ? AND #static.PUBLIC#",
+			[ arguments.slug ],
+			{ returnType: "array" }
+		)
+		return rows.len() ? withTags( rows )[ 1 ] : {}
+	}
+
+	/** Any post by slug, public or not, for an author's preview. */
+	struct function anyBySlug( required string slug ) {
+		var rows = variables.db.query(
+			"SELECT #static.COLUMNS#, p.body_html FROM posts p JOIN users u ON u.id = p.author_id WHERE p.slug = ?",
+			[ arguments.slug ],
+			{ returnType: "array" }
+		)
+		return rows.len() ? withTags( rows )[ 1 ] : {}
+	}
+
+	/** { newer, older }: the public posts either side of this one, each { title, url } or {}. */
+	struct function neighbours( required struct post ) {
+		return {
+			newer : neighbour( arguments.post, ">", "ASC" ),
+			older : neighbour( arguments.post, "<", "DESC" )
+		}
+	}
+
+	private struct function neighbour( required struct post, required string comparison, required string order ) {
+		var at = isoToSql( arguments.post.publishedAt )
+		var rows = variables.db.query(
+			"SELECT p.title, p.slug FROM posts p
+			WHERE #static.PUBLIC# AND ( p.published_at #arguments.comparison# ? OR ( p.published_at = ? AND p.id #arguments.comparison# ? ) )
+			ORDER BY p.published_at #arguments.order#, p.id #arguments.order# LIMIT 1",
+			[ at, at, arguments.post.id ],
+			{ returnType: "array" }
+		)
+		return rows.len() ? { title: rows[ 1 ].title, url: urlFor( rows[ 1 ].slug ) } : {}
+	}
+
+	/**
+	 * Full-text search over public posts: { posts, total, page, pageSize, totalPages }.
+	 * Words MySQL won't index (shorter than three letters) fall back to a plain match.
+	 */
+	struct function search( required string query, numeric page = 1, numeric pageSize = 10 ) {
+		var q = left( trim( arguments.query ), 200 )
+		if ( !len( q ) ) {
+			return { posts: [], total: 0, page: 1, pageSize: arguments.pageSize, totalPages: 0 }
+		}
+		var found = paged(
+			"#static.PUBLIC# AND MATCH( p.title, p.excerpt, p.body ) AGAINST ( ? IN NATURAL LANGUAGE MODE )",
+			[ q ],
+			"MATCH( p.title, p.excerpt, p.body ) AGAINST ( ? IN NATURAL LANGUAGE MODE ) DESC, p.published_at DESC",
+			arguments.page,
+			arguments.pageSize,
+			[ q ]
+		)
+		if ( found.total == 0 ) {
+			var like = "%" & q.replace( "\", "\\", "all" ).replace( "%", "\%", "all" ).replace( "_", "\_", "all" ) & "%"
+			found = paged( "#static.PUBLIC# AND ( p.title LIKE ? OR p.excerpt LIKE ? OR p.body LIKE ? )", [ like, like, like ], "p.published_at DESC", arguments.page, arguments.pageSize )
+		}
+		if ( arguments.page == 1 ) {
+			variables.db.execute( "INSERT INTO search_log ( query, result_count ) VALUES ( ?, ? )", [ left( lcase( q ), 255 ), found.total ] )
+		}
+		return found
+	}
+
+	/** The newest public posts with their HTML, for the feed. */
+	array function forFeed( numeric limit = 20 ) {
+		var rows = variables.db.query(
+			"SELECT #static.COLUMNS#, p.body_html FROM posts p JOIN users u ON u.id = p.author_id WHERE #static.PUBLIC#
+			ORDER BY p.published_at DESC, p.id DESC LIMIT #int( arguments.limit )#",
+			[],
+			{ returnType: "array" }
+		)
+		return withTags( rows )
+	}
+
+	/** [ { url, updatedAt } ] for every public post, for sitemap.xml. */
+	array function forSitemap() {
+		return variables.db.query(
+			"SELECT p.slug, DATE_FORMAT( GREATEST( p.updated_at, p.published_at ), #static.ISO# ) AS updated_iso FROM posts p WHERE #static.PUBLIC# ORDER BY p.published_at DESC",
+			[],
+			{ returnType: "array" }
+		).map( ( r ) => { return { url: urlFor( r.slug ), updatedAt: r.updated_iso } } )
+	}
+
+	/** The time the newest public post went up, as ISO, or "" with none: the feed's and home page's freshness. */
+	string function lastPublished() {
+		var q = variables.db.query( "SELECT DATE_FORMAT( MAX( p.published_at ), #static.ISO# ) AS latest FROM posts p WHERE #static.PUBLIC#" )
+		return q.latest ?: ""
+	}
+
+	/** Counts a reader's view of a public post, for Insights. */
+	void function recordView( required numeric postId ) {
+		variables.db.execute(
+			"INSERT INTO post_views_daily ( post_id, view_date, views ) VALUES ( ?, UTC_DATE(), 1 ) ON DUPLICATE KEY UPDATE views = views + 1",
+			[ arguments.postId ]
+		)
+	}
+
+	string function urlFor( required string slug ) {
+		return "/posts/" & encodeForURL( arguments.slug )
+	}
+
+	// ── The admin ───────────────────────────────────────────────────────────
+
+	/**
+	 * A page of posts for the admin's list: { posts, total, page, pageSize, totalPages }.
+	 * filter: { status: all|draft|scheduled|published, authorId?, q? }
+	 */
+	struct function adminPage( numeric page = 1, numeric pageSize = 25, struct filter = {} ) {
+		var where  = [ "1 = 1" ]
+		var params = []
+		switch ( arguments.filter.status ?: "all" ) {
+			case "draft":
+				where.append( "p.status = 'draft'" )
+				break
+			case "scheduled":
+				where.append( "p.status = 'published' AND p.published_at > UTC_TIMESTAMP()" )
+				break
+			case "published":
+				where.append( static.PUBLIC )
+				break
+		}
+		if ( val( arguments.filter.authorId ?: 0 ) ) {
+			where.append( "p.author_id = ?" )
+			params.append( arguments.filter.authorId )
+		}
+		if ( len( trim( arguments.filter.q ?: "" ) ) ) {
+			where.append( "p.title LIKE ?" )
+			params.append( "%" & trim( arguments.filter.q ) & "%" )
+		}
+		return paged( where.toList( " AND " ), params, "COALESCE( p.published_at, p.updated_at ) DESC, p.id DESC", arguments.page, arguments.pageSize )
+	}
+
+	/** The post with its Markdown, for the editor; {} when there's none. */
+	struct function get( required numeric id ) {
+		var rows = variables.db.query(
+			"SELECT #static.COLUMNS#, p.body, p.body_html FROM posts p JOIN users u ON u.id = p.author_id WHERE p.id = ?",
+			[ arguments.id ],
+			{ returnType: "array" }
+		)
+		if ( !rows.len() ) {
+			return {}
+		}
+		var post = withTags( rows )[ 1 ]
+		post.body = rows[ 1 ].body
+		return post
+	}
+
+	/** Whether this user (req.user: { id, isAdmin }) may change this post. */
+	boolean function canEdit( required struct user, required struct post ) {
+		return ( arguments.user.isAdmin ?: false ) || arguments.post.authorId == arguments.user.id
+	}
+
+	/**
+	 * { title, body, slug?, excerpt?, coverImage?, tags?, status?, publishedAt?, featured? }.
+	 * Answers the post as get() does. Throws Posts.Invalid.
+	 */
+	struct function create( required numeric authorId, required struct payload ) {
+		var fields = fieldsOf( arguments.payload, {} )
+		var rendered = variables.markdown.render( fields.body, variables.siteHost )
+		var id = variables.db.execute(
+			"INSERT INTO posts ( author_id, title, slug, excerpt, body, body_html, cover_image, status, published_at, featured, reading_minutes )
+			VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )",
+			[
+				arguments.authorId, fields.title, uniqueSlug( fields.slug ), excerptOf( fields.excerpt, rendered.summary ),
+				fields.body, rendered.html, nullable( fields.coverImage ), fields.status,
+				nullable( fields.publishedAt ), fields.featured ? 1 : 0, rendered.readingMinutes
+			]
+		).generatedKey
+		variables.tags.setForPost( id, fields.tags )
+		variables.revisions.snapshot( id, arguments.authorId )
+		return get( id )
+	}
+
+	/** The same fields as create(), any of them; those left out keep their value. */
+	struct function update( required numeric id, required numeric editorId, required struct payload ) {
+		var current = get( arguments.id )
+		if ( current.isEmpty() ) {
+			throw( type = "Posts.NotFound", message = "No such post" )
+		}
+		var fields = fieldsOf( arguments.payload, current )
+		var rendered = variables.markdown.render( fields.body, variables.siteHost )
+		var slug = compare( fields.slug, current.slug ) == 0 ? current.slug : uniqueSlug( fields.slug, arguments.id )
+		variables.db.execute(
+			"UPDATE posts SET title = ?, slug = ?, excerpt = ?, body = ?, body_html = ?, cover_image = ?, status = ?, published_at = ?,
+				featured = ?, reading_minutes = ? WHERE id = ?",
+			[
+				fields.title, slug, excerptOf( fields.excerpt, rendered.summary ), fields.body, rendered.html,
+				nullable( fields.coverImage ), fields.status, nullable( fields.publishedAt ),
+				fields.featured ? 1 : 0, rendered.readingMinutes, arguments.id
+			]
+		)
+		variables.tags.setForPost( arguments.id, fields.tags )
+		variables.revisions.snapshot( arguments.id, arguments.editorId )
+		return get( arguments.id )
+	}
+
+	void function remove( required numeric id ) {
+		variables.db.execute( "DELETE FROM posts WHERE id = ?", [ arguments.id ] )
+		variables.tags.pruneUnused()
+	}
+
+	/** Markdown as the post page would show it, for the editor's preview. */
+	struct function preview( string body = "" ) {
+		var rendered = variables.markdown.render( arguments.body, variables.siteHost )
+		return { html: rendered.html, readingMinutes: rendered.readingMinutes }
+	}
+
+	/** Every stored post rendered again, as after a change to Markdown or Sanitizer. @return how many */
+	numeric function rerenderAll() {
+		var rows = variables.db.query( "SELECT id, body FROM posts", [], { returnType: "array" } )
+		for ( var r in rows ) {
+			var rendered = variables.markdown.render( r.body, variables.siteHost )
+			variables.db.execute(
+				"UPDATE posts SET body_html = ?, reading_minutes = ?, updated_at = updated_at WHERE id = ?",
+				[ rendered.html, rendered.readingMinutes, r.id ]
+			)
+		}
+		return rows.len()
+	}
+
+	/** { total, published, scheduled, drafts, featured } for the dashboard; authorId 0 counts everyone's. */
+	struct function counts( numeric authorId = 0 ) {
+		var mine = arguments.authorId ? "AND p.author_id = #int( arguments.authorId )#" : ""
+		return variables.db.query(
+			"SELECT COUNT(*) AS total,
+				COALESCE( SUM( #static.PUBLIC# ), 0 ) AS published,
+				COALESCE( SUM( p.status = 'published' AND p.published_at > UTC_TIMESTAMP() ), 0 ) AS scheduled,
+				COALESCE( SUM( p.status = 'draft' ), 0 ) AS drafts,
+				COALESCE( SUM( p.featured = 1 ), 0 ) AS featured,
+				COALESCE( SUM( p.cover_image IS NULL OR p.cover_image = '' ), 0 ) AS missingCover,
+				COALESCE( SUM( NOT EXISTS ( SELECT 1 FROM post_tags pt WHERE pt.post_id = p.id ) ), 0 ) AS missingTags
+			FROM posts p WHERE 1 = 1 #mine#",
+			[],
+			{ returnType: "array" }
+		)[ 1 ]
+	}
+
+	/** Posts scheduled to go up, soonest first. */
+	array function upcoming( numeric limit = 5, numeric authorId = 0 ) {
+		var mine = arguments.authorId ? "AND p.author_id = #int( arguments.authorId )#" : ""
+		return viewsOf( variables.db.query(
+			"SELECT #static.COLUMNS# FROM posts p JOIN users u ON u.id = p.author_id
+			WHERE p.status = 'published' AND p.published_at > UTC_TIMESTAMP() #mine# ORDER BY p.published_at LIMIT #int( arguments.limit )#",
+			[],
+			{ returnType: "array" }
+		) )
+	}
+
+	/** The most recently changed posts. */
+	array function recentlyChanged( numeric limit = 8, numeric authorId = 0 ) {
+		var mine = arguments.authorId ? "WHERE p.author_id = #int( arguments.authorId )#" : ""
+		return viewsOf( variables.db.query(
+			"SELECT #static.COLUMNS# FROM posts p JOIN users u ON u.id = p.author_id #mine# ORDER BY p.updated_at DESC LIMIT #int( arguments.limit )#",
+			[],
+			{ returnType: "array" }
+		) )
+	}
+
+	/** Posts published or scheduled from one instant up to another (ISO 8601), for the calendar. */
+	array function inRange( required string fromIso, required string toIso, numeric authorId = 0 ) {
+		var mine = arguments.authorId ? "AND p.author_id = #int( arguments.authorId )#" : ""
+		return viewsOf( variables.db.query(
+			"SELECT #static.COLUMNS# FROM posts p JOIN users u ON u.id = p.author_id
+			WHERE p.status = 'published' AND p.published_at >= ? AND p.published_at < ? #mine#
+			ORDER BY p.published_at",
+			[ isoToSql( arguments.fromIso ), isoToSql( arguments.toIso ) ],
+			{ returnType: "array" }
+		) )
+	}
+
+	/** Drafts, the most recently changed first, for the calendar's side list. */
+	array function drafts( numeric limit = 50, numeric authorId = 0 ) {
+		var mine = arguments.authorId ? "AND p.author_id = #int( arguments.authorId )#" : ""
+		return variables.db.query(
+			"SELECT p.id, p.title FROM posts p WHERE p.status = 'draft' #mine# ORDER BY p.updated_at DESC LIMIT #int( arguments.limit )#",
+			[],
+			{ returnType: "array" }
+		)
+	}
+
+	/** { postId: views } over all time, for these posts. */
+	struct function viewTotals( required array postIds ) {
+		var result = {}
+		if ( !arguments.postIds.len() ) {
+			return result
+		}
+		for ( var r in variables.db.query(
+			"SELECT post_id, SUM( views ) AS views FROM post_views_daily WHERE post_id IN ( #arguments.postIds.map( () => '?' ).toList()# ) GROUP BY post_id",
+			arguments.postIds,
+			{ returnType: "array" }
+		) ) {
+			result[ r.post_id ] = r.views
+		}
+		return result
+	}
+
+	// ── Shared ──────────────────────────────────────────────────────────────
+
+	/** A slug from text: lower case, a-z 0-9 and single dashes. */
+	// not "slugify": that name is a BoxLang built-in, which an unqualified call reaches first
+	static string function toSlug( required string text ) {
+		var slug = createObject( "java", "java.lang.String" ).init( lcase( trim( arguments.text ) ) )
+			.replaceAll( "['\u2019]", "" )
+			.replaceAll( "[^a-z0-9]+", "-" )
+			.replaceAll( "^-+|-+$", "" )
+		return createObject( "java", "java.lang.String" ).init( left( slug, 200 ) ).replaceAll( "-+$", "" )
+	}
+
+	private struct function paged( required string where, required array params, required string orderBy, required numeric page, required numeric pageSize, array orderParams = [] ) {
+		var size  = max( 1, min( int( arguments.pageSize ), 100 ) )
+		var total = variables.db.query( "SELECT COUNT(*) AS n FROM posts p WHERE #arguments.where#", arguments.params ).n
+		var totalPages = ceiling( total / size )
+		var page  = max( 1, int( arguments.page ) )
+		var rows  = variables.db.query(
+			"SELECT #static.COLUMNS# FROM posts p JOIN users u ON u.id = p.author_id WHERE #arguments.where#
+			ORDER BY #arguments.orderBy# LIMIT #size# OFFSET #( page - 1 ) * size#",
+			duplicate( arguments.params ).append( arguments.orderParams, true ),
+			{ returnType: "array" }
+		)
+		return { posts: viewsOf( rows ), total: total, page: page, pageSize: size, totalPages: totalPages }
+	}
+
+	private array function viewsOf( required array rows ) {
+		return withTags( arguments.rows )
+	}
+
+	private array function withTags( required array rows ) {
+		var byPost = variables.tags.forPosts( arguments.rows.map( ( r ) => r.id ) )
+		return arguments.rows.map( ( r ) => view( r, byPost[ r.id ] ?: [] ) )
+	}
+
+	private struct function view( required struct r, required array tagList ) {
+		var row = arguments.r
+		var status = row.status == "draft" ? "draft" : ( row.scheduled == 1 ? "scheduled" : "published" )
+		var post = {
+			id             : row.id,
+			authorId       : row.author_id,
+			title          : row.title,
+			slug           : row.slug,
+			url            : urlFor( row.slug ),
+			excerpt        : row.excerpt,
+			coverImage     : row.cover_image ?: "",
+			status         : status,
+			featured       : row.featured == 1,
+			readingMinutes : row.reading_minutes,
+			publishedAt    : row.published_iso ?: "",
+			createdAt      : row.created_iso,
+			updatedAt      : row.updated_iso,
+			tags           : arguments.tagList,
+			author         : variables.users.person( {
+				id           : row.author_id,
+				username     : row.author_username,
+				display_name : row.author_display_name,
+				bio          : row.author_bio ?: "",
+				avatar_url   : row.author_avatar_url ?: "",
+				website      : row.author_website ?: ""
+			} )
+		}
+		if ( row.keyExists( "body_html" ) ) {
+			post.html = row.body_html
+		}
+		return post
+	}
+
+	/** The payload checked and merged over the post's current values. Throws Posts.Invalid or Tags.Invalid. */
+	private struct function fieldsOf( required struct payload, required struct current ) {
+		var p = arguments.payload
+		var c = arguments.current
+		var fields = {
+			title       : p.keyExists( "title" ) ? text( p.title, "title" ) : ( c.title ?: "" ),
+			body        : p.keyExists( "body" ) ? text( p.body, "body", false ) : ( c.body ?: "" ),
+			excerpt     : p.keyExists( "excerpt" ) ? text( p.excerpt, "excerpt" ) : ( c.excerpt ?: "" ),
+			coverImage  : p.keyExists( "coverImage" ) ? text( p.coverImage, "coverImage" ) : ( c.coverImage ?: "" ),
+			status      : p.keyExists( "status" ) ? text( p.status, "status" ) : ( c.status ?: "draft" ),
+			featured    : p.keyExists( "featured" ) ? ( isBoolean( p.featured ?: false ) && p.featured ) : ( c.featured ?: false ),
+			tags        : p.keyExists( "tags" ) ? variables.tags.namesOf( p.tags ?: [] ) : ( c.tags ?: [] ).map( ( t ) => t.name )
+		}
+		// a scheduled post is stored as published, with its time ahead
+		if ( fields.status == "scheduled" ) {
+			fields.status = "published"
+		}
+		if ( !listFind( static.STATUSES, fields.status ) ) {
+			throw( type = "Posts.Invalid", message = "status must be draft or published" )
+		}
+		if ( !len( fields.title ) ) {
+			throw( type = "Posts.Invalid", message = "A post needs a title" )
+		}
+		if ( len( fields.title ) > static.MAX_TITLE ) {
+			throw( type = "Posts.Invalid", message = "A title is at most #static.MAX_TITLE# characters" )
+		}
+		if ( len( fields.excerpt ) > static.MAX_EXCERPT ) {
+			throw( type = "Posts.Invalid", message = "An excerpt is at most #static.MAX_EXCERPT# characters" )
+		}
+		if ( len( fields.body ) > static.MAX_BODY ) {
+			throw( type = "Posts.Invalid", message = "That post is too long" )
+		}
+		if ( len( fields.coverImage ) && !reFindNoCase( "^(https?://|/)[^\s""'<>]+$", fields.coverImage ) ) {
+			throw( type = "Posts.Invalid", message = "coverImage must be a web address" )
+		}
+
+		var slugSource = p.keyExists( "slug" ) && len( text( p.slug, "slug" ) ) ? text( p.slug, "slug" ) : ( len( c.slug ?: "" ) ? c.slug : fields.title )
+		fields.slug = toSlug( slugSource )
+		if ( !len( fields.slug ) ) {
+			fields.slug = "post"
+		}
+
+		// published_at: as given; when publishing without one, the time it was first published, or now
+		var given = p.keyExists( "publishedAt" ) ? text( p.publishedAt, "publishedAt" ) : ""
+		if ( len( given ) ) {
+			fields.publishedAt = isoToSql( given )
+		} else if ( len( c.publishedAt ?: "" ) && !( p.keyExists( "publishedAt" ) && fields.status == "draft" ) ) {
+			fields.publishedAt = isoToSql( c.publishedAt )
+		} else {
+			fields.publishedAt = fields.status == "published" ? utcNow() : ""
+		}
+		return fields
+	}
+
+	private string function text( value, required string name, boolean trimmed = true ) {
+		if ( isNull( arguments.value ) ) {
+			return ""
+		}
+		if ( !isSimpleValue( arguments.value ) ) {
+			throw( type = "Posts.Invalid", message = "#arguments.name# must be text" )
+		}
+		return arguments.trimmed ? trim( toString( arguments.value ) ) : toString( arguments.value )
+	}
+
+	/** The excerpt as written, or the start of the post's paragraphs when it's blank. */
+	private string function excerptOf( required string excerpt, required string bodyText ) {
+		if ( len( arguments.excerpt ) ) {
+			return arguments.excerpt
+		}
+		var words = trim( arguments.bodyText )
+		if ( len( words ) <= static.AUTO_EXCERPT ) {
+			return words
+		}
+		return reReplace( left( words, static.AUTO_EXCERPT ), "\s+\S*$", "" ) & "…"
+	}
+
+	/** The slug, or it with -2, -3... when another post has it. */
+	private string function uniqueSlug( required string slug, numeric exceptId = 0 ) {
+		var candidate = arguments.slug
+		var n = 1
+		while ( variables.db.query( "SELECT COUNT(*) AS n FROM posts WHERE slug = ? AND id <> ?", [ candidate, arguments.exceptId ] ).n ) {
+			n++
+			candidate = left( arguments.slug, 195 ) & "-" & n
+		}
+		return candidate
+	}
+
+	/** An ISO 8601 instant (2026-11-13T15:00:00Z, or with an offset) as a MySQL UTC datetime. Throws Posts.Invalid. */
+	private string function isoToSql( required string iso ) {
+		try {
+			var instant = createObject( "java", "java.time.OffsetDateTime" ).parse( arguments.iso ).toInstant()
+			return createObject( "java", "java.time.format.DateTimeFormatter" )
+				.ofPattern( "yyyy-MM-dd HH:mm:ss" )
+				.withZone( createObject( "java", "java.time.ZoneOffset" ).UTC )
+				.format( instant )
+		} catch ( any e ) {
+			throw( type = "Posts.Invalid", message = "publishedAt must be an ISO 8601 time with a zone, e.g. 2026-11-13T15:00:00Z" )
+		}
+	}
+
+	private string function utcNow() {
+		return createObject( "java", "java.time.format.DateTimeFormatter" )
+			.ofPattern( "yyyy-MM-dd HH:mm:ss" )
+			.withZone( createObject( "java", "java.time.ZoneOffset" ).UTC )
+			.format( createObject( "java", "java.time.Instant" ).now() )
+	}
+
+	private function nullable( required string value ) {
+		return len( arguments.value ) ? arguments.value : { value: "", null: true }
+	}
+
+}

@@ -1,0 +1,120 @@
+/**
+ * What machines read: the RSS feed (/feed.xml), the sitemap (/sitemap.xml)
+ * and robots.txt. Every address in them is absolute, made from SITE_URL,
+ * since a feed reader or crawler has no page to resolve a relative one against.
+ */
+class {
+
+	property name="posts";
+	property name="tags";
+	property name="users";
+	property name="siteSettings";
+	property name="siteUrl" type="string";
+
+	static {
+		FEED_ITEMS = 20
+	}
+
+	function init( required posts, required tags, required users, required siteSettings, required string siteUrl ) {
+		variables.posts        = arguments.posts
+		variables.tags         = arguments.tags
+		variables.users        = arguments.users
+		variables.siteSettings = arguments.siteSettings
+		variables.siteUrl      = reReplace( arguments.siteUrl, "/+$", "" )
+		return this
+	}
+
+	string function rss() {
+		var site  = variables.siteSettings.all()
+		var items = variables.posts.forFeed( static.FEED_ITEMS )
+		var out = createObject( "java", "java.lang.StringBuilder" ).init()
+		out.append( '<?xml version="1.0" encoding="UTF-8"?>' & char( 10 ) )
+		out.append( '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/">' )
+		out.append( "<channel>" )
+		out.append( "<title>#xml( site.title )#</title>" )
+		out.append( "<link>#xml( variables.siteUrl )#/</link>" )
+		out.append( "<description>#xml( len( site.description ) ? site.description : site.tagline )#</description>" )
+		out.append( "<language>#xml( site.language )#</language>" )
+		out.append( '<atom:link href="#xml( variables.siteUrl )#/feed.xml" rel="self" type="application/rss+xml"/>' )
+		if ( items.len() ) {
+			out.append( "<lastBuildDate>#rfc822( items[ 1 ].publishedAt )#</lastBuildDate>" )
+		}
+		for ( var post in items ) {
+			var link = variables.siteUrl & post.url
+			out.append( "<item>" )
+			out.append( "<title>#xml( post.title )#</title>" )
+			out.append( "<link>#xml( link )#</link>" )
+			out.append( '<guid isPermaLink="true">#xml( link )#</guid>' )
+			out.append( "<pubDate>#rfc822( post.publishedAt )#</pubDate>" )
+			out.append( "<dc:creator>#xml( post.author.displayName )#</dc:creator>" )
+			for ( var tag in post.tags ) {
+				out.append( "<category>#xml( tag.name )#</category>" )
+			}
+			out.append( "<description>#xml( post.excerpt )#</description>" )
+			out.append( "<content:encoded><![CDATA[#cdata( absolute( coverHtml( post ) & post.html ) )#]]></content:encoded>" )
+			out.append( "</item>" )
+		}
+		out.append( "</channel></rss>" )
+		return out.toString()
+	}
+
+	string function sitemap() {
+		var out = createObject( "java", "java.lang.StringBuilder" ).init()
+		out.append( '<?xml version="1.0" encoding="UTF-8"?>' & char( 10 ) )
+		out.append( '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' )
+		var latest = variables.posts.lastPublished()
+		out.append( "<url><loc>#xml( variables.siteUrl )#/</loc>#len( latest ) ? '<lastmod>' & latest & '</lastmod>' : ''#</url>" )
+		for ( var entry in variables.posts.forSitemap() ) {
+			out.append( "<url><loc>#xml( variables.siteUrl & entry.url )#</loc><lastmod>#entry.updatedAt#</lastmod></url>" )
+		}
+		for ( var tag in variables.tags.popular() ) {
+			out.append( "<url><loc>#xml( variables.siteUrl )#/tag/#encodeForURL( tag.slug )#</loc></url>" )
+		}
+		for ( var author in variables.users.authorsWithPosts() ) {
+			out.append( "<url><loc>#xml( variables.siteUrl )#/author/#encodeForURL( author.username )#</loc></url>" )
+		}
+		out.append( "</urlset>" )
+		return out.toString()
+	}
+
+	string function robots() {
+		var nl = char( 10 )
+		return "User-agent: *" & nl
+			& "Disallow: /admin" & nl
+			& "Disallow: /api/" & nl
+			& "Disallow: /search" & nl
+			& nl
+			& "Sitemap: #variables.siteUrl#/sitemap.xml" & nl
+	}
+
+	private string function coverHtml( required struct post ) {
+		return len( arguments.post.coverImage ) ? '<p><img src="#encodeForHTMLAttribute( arguments.post.coverImage )#" alt=""></p>' : ""
+	}
+
+	/** Site-relative addresses (/uploads/..., /posts/...) made absolute. */
+	private string function absolute( required string html ) {
+		return reReplace( arguments.html, "(\s(?:src|href)="")/(?!/)", "\1#variables.siteUrl#/", "all" )
+	}
+
+	/** "]]>" can't appear inside CDATA: split it across two sections. */
+	private string function cdata( required string text ) {
+		return replace( arguments.text, "]]>", "]]]]><![CDATA[>", "all" )
+	}
+
+	/** The five characters XML reserves; encodeForXML() would also escape every ":" and "/" in an address. */
+	private string function xml( required string text ) {
+		return arguments.text.replace( "&", "&amp;", "all" ).replace( "<", "&lt;", "all" ).replace( ">", "&gt;", "all" )
+			.replace( """", "&quot;", "all" ).replace( "'", "&apos;", "all" )
+	}
+
+	/** An ISO 8601 UTC instant as RFC 822, which RSS asks for. */
+	private string function rfc822( required string iso ) {
+		if ( !len( arguments.iso ) ) {
+			return ""
+		}
+		var instant = createObject( "java", "java.time.Instant" ).parse( arguments.iso )
+		return createObject( "java", "java.time.format.DateTimeFormatter" ).RFC_1123_DATE_TIME
+			.format( instant.atZone( createObject( "java", "java.time.ZoneOffset" ).UTC ) )
+	}
+
+}

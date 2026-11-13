@@ -1,0 +1,378 @@
+/**
+ * Accounts: admins and authors. An admin manages everything; an author
+ * writes and manages their own posts. A disabled account can't sign in, and
+ * its posts stay up under its name.
+ */
+class {
+
+	property name="db";
+	property name="dummyHash" type="string";
+
+	static {
+		// no "@": anything with one is an email at sign-in
+		USERNAME_PATTERN = "^[A-Za-z0-9_.-]{1,50}$"
+		// a sanity check, not RFC 5322: something@somewhere.tld, no spaces
+		EMAIL_PATTERN    = "^[^@\s]+@[^@\s]+\.[^@\s]+$"
+		MAX_EMAIL        = 320
+		MIN_PASSWORD     = 8
+		ROLES            = "admin,author"
+	}
+
+	function init( required db ) {
+		variables.db = arguments.db
+		// verify() checks a password even for unknown usernames, against this,
+		// so a wrong username takes as long as a wrong password
+		variables.dummyHash = bcryptHash( createUUID() )
+		return this
+	}
+
+	/** The full row, password hash included; {} when there's no such user. */
+	struct function get( required numeric id ) {
+		var rows = variables.db.query( "SELECT * FROM users WHERE id = ?", [ arguments.id ], { returnType: "array" } )
+		return rows.len() ? rows[ 1 ] : {}
+	}
+
+	struct function findByUsername( required string username ) {
+		if ( !len( trim( arguments.username ) ) ) {
+			return {}
+		}
+		var rows = variables.db.query( "SELECT * FROM users WHERE username = ?", [ trim( arguments.username ) ], { returnType: "array" } )
+		return rows.len() ? rows[ 1 ] : {}
+	}
+
+	struct function findByEmail( required string email ) {
+		if ( !len( trim( arguments.email ) ) ) {
+			return {}
+		}
+		var rows = variables.db.query( "SELECT * FROM users WHERE email = ?", [ trim( arguments.email ) ], { returnType: "array" } )
+		return rows.len() ? rows[ 1 ] : {}
+	}
+
+	/** By username, or by email when it has an "@". */
+	struct function findForLogin( string login = "" ) {
+		var typed = trim( arguments.login )
+		if ( typed contains "@" ) {
+			return findByEmail( typed )
+		}
+		return len( typed ) ? findByUsername( typed ) : {}
+	}
+
+	numeric function count() {
+		return variables.db.query( "SELECT COUNT(*) AS n FROM users" ).n
+	}
+
+	numeric function adminCount() {
+		return variables.db.query( "SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND disabled_at IS NULL" ).n
+	}
+
+	/** Throws Users.Invalid, Users.Exists or Users.EmailTaken. */
+	struct function create( required string username, required string password, required string role, required string email, string displayName = "" ) {
+		validateUsername( arguments.username )
+		validatePassword( arguments.password )
+		validateRole( arguments.role )
+		var address = requireEmail( arguments.email )
+		return insertUser( trim( arguments.username ), bcryptHash( arguments.password ), arguments.role, address, trim( arguments.displayName ) )
+	}
+
+	/** The user for a login and password, or {}; a disabled account never matches. */
+	struct function verify( string login = "", string password = "" ) {
+		var user = findForLogin( arguments.login )
+		var hash = len( user.password_hash ?: "" ) ? user.password_hash : variables.dummyHash
+		var ok   = false
+		try {
+			ok = bcryptVerify( arguments.password, hash )
+		} catch ( any e ) {
+			ok = false
+		}
+		return ( ok && !user.isEmpty() && len( user.password_hash ) && !len( user.disabled_at ?: "" ) ) ? user : {}
+	}
+
+	boolean function checkPassword( required numeric id, string password = "" ) {
+		var hash = get( arguments.id ).password_hash ?: ""
+		if ( !len( hash ) ) {
+			return false
+		}
+		try {
+			return bcryptVerify( arguments.password, hash )
+		} catch ( any e ) {
+			return false
+		}
+	}
+
+	void function setPassword( required numeric id, required string password ) {
+		validatePassword( arguments.password )
+		variables.db.execute( "UPDATE users SET password_hash = ? WHERE id = ?", [ bcryptHash( arguments.password ), arguments.id ] )
+	}
+
+	void function recordLogin( required numeric id ) {
+		variables.db.execute( "UPDATE users SET last_login_at = UTC_TIMESTAMP() WHERE id = ?", [ arguments.id ] )
+	}
+
+	/** Changes when the password, username or role does, which ends the account's other sessions. */
+	string function fingerprint( required struct user ) {
+		return left( hash( "#arguments.user.id#|#arguments.user.username#|#arguments.user.role#|#arguments.user.password_hash#", "SHA-256" ).lcase(), 32 )
+	}
+
+	/** The session's user, or {} when it has none, or it's disabled, or its fingerprint has moved on. */
+	struct function fromSession( required struct sessionData ) {
+		var userId = arguments.sessionData.userId ?: ""
+		if ( !isNumeric( userId ) ) {
+			return {}
+		}
+		var user = get( userId )
+		if ( user.isEmpty() || !len( user.password_hash ) || len( user.disabled_at ?: "" ) ) {
+			return {}
+		}
+		return compare( arguments.sessionData.authVersion ?: "", fingerprint( user ) ) == 0 ? user : {}
+	}
+
+	/**
+	 * Creates the first admin from the environment on a new site: an empty
+	 * database, or one holding only the untouched default account
+	 * (migrations/002_default_admin.sql), which it replaces. "" otherwise.
+	 */
+	string function claimFromEnvironment( string username = "", string passwordHash = "", string email = "" ) {
+		if ( !len( arguments.username ) || !len( arguments.passwordHash ) ) {
+			return ""
+		}
+		var replacing = this.count() == 1 && defaultAdminActive()
+		if ( this.count() > 0 && !replacing ) {
+			return ""
+		}
+		validateUsername( arguments.username )
+		var address = requireEmail( arguments.email )
+		if ( replacing ) {
+			variables.db.execute( "DELETE FROM users WHERE username = 'admin'" )
+		}
+		insertUser( trim( arguments.username ), arguments.passwordHash, "admin", address, "" )
+		return "Created the first account, #arguments.username# (admin)#replacing ? ', in place of the default admin' : ''#"
+	}
+
+	/** Whether the default account (admin / admin) can still sign in: the server warns while it can. */
+	boolean function defaultAdminActive() {
+		return !verify( "admin", "admin" ).isEmpty()
+	}
+
+	/** { displayName?, bio?, avatarUrl?, website?, email? } for the account itself. */
+	void function updateProfile( required numeric id, required struct changes ) {
+		var sets   = []
+		var params = []
+		var c      = arguments.changes
+		if ( c.keyExists( "displayName" ) ) {
+			sets.append( "display_name = ?" )
+			params.append( left( trim( stringOf( c.displayName ) ), 100 ) )
+		}
+		if ( c.keyExists( "bio" ) ) {
+			var bio = trim( stringOf( c.bio ) )
+			if ( len( bio ) > 1000 ) {
+				throw( type = "Users.Invalid", message = "A bio is at most 1000 characters" )
+			}
+			sets.append( "bio = ?" )
+			params.append( bio )
+		}
+		if ( c.keyExists( "avatarUrl" ) ) {
+			sets.append( "avatar_url = ?" )
+			params.append( addressOf( c.avatarUrl, 1000 ) )
+		}
+		if ( c.keyExists( "website" ) ) {
+			sets.append( "website = ?" )
+			params.append( addressOf( c.website, 500 ) )
+		}
+		if ( c.keyExists( "email" ) ) {
+			var address = requireEmail( stringOf( c.email ) )
+			requireFreeEmail( address, arguments.id )
+			sets.append( "email = ?" )
+			params.append( address )
+		}
+		if ( !sets.len() ) {
+			return
+		}
+		params.append( arguments.id )
+		variables.db.execute( "UPDATE users SET #sets.toList( ', ' )# WHERE id = ?", params )
+	}
+
+	/** What the public and the admin's lists show of an account. */
+	struct function person( required struct row ) {
+		return {
+			id          : arguments.row.id,
+			username    : arguments.row.username,
+			displayName : len( arguments.row.display_name ?: "" ) ? arguments.row.display_name : arguments.row.username,
+			bio         : arguments.row.bio ?: "",
+			avatarUrl   : arguments.row.avatar_url ?: "",
+			website     : arguments.row.website ?: "",
+			initials    : initialsOf( len( arguments.row.display_name ?: "" ) ? arguments.row.display_name : arguments.row.username )
+		}
+	}
+
+	/** Every account, for Admin > Authors: with role, status and post counts. */
+	array function list( numeric id = 0 ) {
+		var rows = variables.db.query(
+			"SELECT u.*,
+				( SELECT COUNT(*) FROM posts p WHERE p.author_id = u.id ) AS post_count,
+				( SELECT COUNT(*) FROM user_passkeys k WHERE k.user_id = u.id ) AS passkey_count
+			FROM users u #arguments.id ? 'WHERE u.id = ?' : ''# ORDER BY u.role, u.username",
+			arguments.id ? [ arguments.id ] : [],
+			{ returnType: "array" }
+		)
+		return rows.map( ( r ) => adminView( r ) )
+	}
+
+	struct function adminView( required struct row ) {
+		return person( arguments.row ).append( {
+			email       : arguments.row.email,
+			role        : arguments.row.role,
+			disabled    : len( arguments.row.disabled_at ?: "" ) > 0,
+			lastLoginAt : isDate( arguments.row.last_login_at ?: "" ) ? isoOf( arguments.row.last_login_at ) : javacast( "null", "" ),
+			createdAt   : isoOf( arguments.row.created_at ),
+			postCount   : arguments.row.post_count ?: 0,
+			passkeys    : arguments.row.passkey_count ?: 0
+		} )
+	}
+
+	/** Authors with at least one public post, for the site. */
+	array function authorsWithPosts() {
+		return variables.db.query(
+			"SELECT u.*, COUNT(p.id) AS post_count FROM users u
+			JOIN posts p ON p.author_id = u.id AND p.status = 'published' AND p.published_at <= UTC_TIMESTAMP()
+			GROUP BY u.id ORDER BY u.display_name, u.username",
+			[],
+			{ returnType: "array" }
+		).map( ( r ) => person( r ).append( { postCount: r.post_count } ) )
+	}
+
+	/** Throws Users.LastAdmin when it would leave no admin. */
+	void function setRole( required numeric id, required string role ) {
+		validateRole( arguments.role )
+		var user = get( arguments.id )
+		if ( arguments.role != "admin" && ( user.role ?: "" ) == "admin" && adminCount() <= 1 ) {
+			throw( type = "Users.LastAdmin", message = "#user.username# is the only admin" )
+		}
+		variables.db.execute( "UPDATE users SET role = ? WHERE id = ?", [ arguments.role, arguments.id ] )
+	}
+
+	/** Throws Users.LastAdmin for the only admin. */
+	void function setDisabled( required numeric id, required boolean disabled ) {
+		var user = get( arguments.id )
+		if ( arguments.disabled && ( user.role ?: "" ) == "admin" && adminCount() <= 1 ) {
+			throw( type = "Users.LastAdmin", message = "#user.username# is the only admin" )
+		}
+		variables.db.execute(
+			"UPDATE users SET disabled_at = #arguments.disabled ? "UTC_TIMESTAMP()" : "NULL"# WHERE id = ?",
+			[ arguments.id ]
+		)
+	}
+
+	/** Only an account with no posts and no media can go; disable one that has them. Throws Users.Conflict. */
+	void function remove( required numeric id ) {
+		var user = get( arguments.id )
+		if ( user.isEmpty() ) {
+			return
+		}
+		if ( user.role == "admin" && adminCount() <= 1 ) {
+			throw( type = "Users.LastAdmin", message = "#user.username# is the only admin" )
+		}
+		var used = variables.db.query(
+			"SELECT ( SELECT COUNT(*) FROM posts WHERE author_id = ? ) + ( SELECT COUNT(*) FROM media WHERE owner_id = ? ) AS n",
+			[ arguments.id, arguments.id ]
+		).n
+		if ( used ) {
+			throw( type = "Users.Conflict", message = "#user.username# has posts or uploads; disable the account instead" )
+		}
+		variables.db.execute( "DELETE FROM users WHERE id = ?", [ arguments.id ] )
+	}
+
+	string function initialsOf( required string name ) {
+		var words = listToArray( trim( arguments.name ), " " )
+		if ( !words.len() ) {
+			return "?"
+		}
+		return uCase( left( words[ 1 ], 1 ) & ( words.len() > 1 ? left( words[ words.len() ], 1 ) : "" ) )
+	}
+
+	// not "insert": an unqualified call to that name reaches BoxLang's insert() string function
+	private struct function insertUser( required string username, required string passwordHash, required string role, required string email, required string displayName ) {
+		if ( !findByUsername( arguments.username ).isEmpty() ) {
+			throw( type = "Users.Exists", message = "There's already a user called #arguments.username#" )
+		}
+		requireFreeEmail( arguments.email )
+		var result = {}
+		try {
+			result = variables.db.execute(
+				"INSERT INTO users ( username, display_name, password_hash, role, email ) VALUES ( ?, ?, ?, ?, ? )",
+				[ arguments.username, left( arguments.displayName, 100 ), arguments.passwordHash, arguments.role, arguments.email ]
+			)
+		} catch ( any e ) {
+			// either taken in the moment since the checks
+			if ( !findByUsername( arguments.username ).isEmpty() ) {
+				throw( type = "Users.Exists", message = "There's already a user called #arguments.username#" )
+			}
+			requireFreeEmail( arguments.email )
+			rethrow;
+		}
+		return get( result.generatedKey )
+	}
+
+	private string function isoOf( required value ) {
+		return dateTimeFormat( arguments.value, "yyyy-mm-dd'T'HH:nn:ss'Z'" )
+	}
+
+	private string function stringOf( value ) {
+		if ( isNull( arguments.value ) ) {
+			return ""
+		}
+		if ( !isSimpleValue( arguments.value ) ) {
+			throw( type = "Users.Invalid", message = "Expected text" )
+		}
+		return toString( arguments.value )
+	}
+
+	/** An http(s) address, a site-relative one (/uploads/...), or "" for none. */
+	private string function addressOf( value, required numeric longest ) {
+		var address = trim( stringOf( arguments.value ?: "" ) )
+		if ( !len( address ) ) {
+			return ""
+		}
+		if ( len( address ) > arguments.longest || !reFindNoCase( "^(https?://[^\s]+|/[^/\s][^\s]*)$", address ) ) {
+			throw( type = "Users.Invalid", message = "That doesn't look like a web address" )
+		}
+		return address
+	}
+
+	private void function validateUsername( required string username ) {
+		if ( !reFind( static.USERNAME_PATTERN, trim( arguments.username ) ) ) {
+			throw( type = "Users.Invalid", message = "Usernames are 1–50 letters, digits, and . _ -" )
+		}
+	}
+
+	private void function validateRole( required string role ) {
+		if ( !listFind( static.ROLES, arguments.role ) ) {
+			throw( type = "Users.Invalid", message = "role must be admin or author" )
+		}
+	}
+
+	/** Trimmed. Throws Users.Invalid when it's missing or isn't an address. */
+	private string function requireEmail( required string email ) {
+		var address = trim( arguments.email )
+		if ( !len( address ) ) {
+			throw( type = "Users.Invalid", message = "An email address is required" )
+		}
+		if ( len( address ) > static.MAX_EMAIL || !reFind( static.EMAIL_PATTERN, address ) ) {
+			throw( type = "Users.Invalid", message = "That doesn't look like an email address" )
+		}
+		return address
+	}
+
+	private void function requireFreeEmail( required string email, numeric exceptId = 0 ) {
+		var holder = findByEmail( arguments.email )
+		if ( !holder.isEmpty() && holder.id != arguments.exceptId ) {
+			throw( type = "Users.EmailTaken", message = "Another account already uses that email" )
+		}
+	}
+
+	private void function validatePassword( required string password ) {
+		if ( len( arguments.password ) < static.MIN_PASSWORD ) {
+			throw( type = "Users.Invalid", message = "Passwords need at least #static.MIN_PASSWORD# characters" )
+		}
+	}
+
+}

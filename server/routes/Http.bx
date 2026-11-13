@@ -1,0 +1,160 @@
+import services.ApiError;
+
+/**
+ * Request parsing helpers shared by the route files. Each one throws an
+ * ApiError rather than returning a sentinel, so handlers stay linear.
+ */
+class {
+
+	/** A path id that isn't a positive integer can't name anything: 404, not 400. */
+	static numeric function pathId( required struct params, string name = "id" ) {
+		var raw = arguments.params[ arguments.name ] ?: ""
+		if ( !reFind( "^[1-9][0-9]{0,18}$", raw ) ) {
+			ApiError::notFound()
+		}
+		return raw
+	}
+
+	static struct function body( required req ) {
+		var payload = arguments.req.body ?: {}
+		if ( !isStruct( payload ) ) {
+			ApiError::badRequest( "Expected a JSON object" )
+		}
+		return payload
+	}
+
+	/** Query-string ids: "" when absent, an integer when present, 400 otherwise. */
+	static function queryId( required struct query, required string name ) {
+		var raw = trim( arguments.query[ arguments.name ] ?: "" )
+		if ( !len( raw ) ) {
+			return ""
+		}
+		if ( !reFind( "^[1-9][0-9]{0,18}$", raw ) ) {
+			ApiError::badRequest( "#arguments.name# must be a positive integer" )
+		}
+		return raw
+	}
+
+	/** A yyyy-mm-dd date, or "" when absent. */
+	static string function queryDate( required struct query, required string name ) {
+		var raw = trim( arguments.query[ arguments.name ] ?: "" )
+		if ( !len( raw ) ) {
+			return ""
+		}
+		try {
+			return createObject( "java", "java.time.LocalDate" ).parse( raw ).toString()
+		} catch ( any e ) {
+			ApiError::badRequest( "#arguments.name# must be a date like 2026-10-03" )
+		}
+	}
+
+	static boolean function queryFlag( required struct query, required string name ) {
+		// exact comparisons: BoxLang's == and list functions treat "yes" as equal to "true"
+		var raw = lcase( trim( arguments.query[ arguments.name ] ?: "" ) )
+		if ( !len( raw ) || compare( raw, "0" ) == 0 || compare( raw, "false" ) == 0 ) {
+			return false
+		}
+		if ( compare( raw, "1" ) == 0 || compare( raw, "true" ) == 0 ) {
+			return true
+		}
+		ApiError::badRequest( "#arguments.name# must be true or false" )
+	}
+
+	static numeric function queryInt( required struct query, required string name, required numeric defaultValue, required numeric minValue, required numeric maxValue ) {
+		var raw = trim( arguments.query[ arguments.name ] ?: "" )
+		if ( !len( raw ) ) {
+			return arguments.defaultValue
+		}
+		if ( !reFind( "^[0-9]{1,9}$", raw ) || raw < arguments.minValue || raw > arguments.maxValue ) {
+			ApiError::badRequest( "#arguments.name# must be between #arguments.minValue# and #arguments.maxValue#" )
+		}
+		return raw
+	}
+
+	/** keyExists() is false for a key whose JSON value is null; PATCH needs to see `"folderId": null`. */
+	static boolean function hasKey( required struct payload, required string name ) {
+		return arguments.payload.keyArray().findNoCase( arguments.name ) > 0
+	}
+
+	/** A JSON true/false (or the strings "true"/"false"); not "yes", 1 or anything else BoxLang would coerce. */
+	static boolean function isBoolean( value ) {
+		if ( isNull( arguments.value ) || !isSimpleValue( arguments.value ) ) {
+			return false
+		}
+		if ( arguments.value.getClass().getName() == "java.lang.Boolean" ) {
+			return true
+		}
+		var text = lcase( toString( arguments.value ) )
+		return compare( text, "true" ) == 0 || compare( text, "false" ) == 0
+	}
+
+	/** Body ids: a positive integer, or null/"" meaning none. */
+	static function optionalBodyId( required struct payload, required string name ) {
+		if ( !hasKey( arguments.payload, arguments.name ) || isNull( arguments.payload[ arguments.name ] ) ) {
+			return ""
+		}
+		var raw = arguments.payload[ arguments.name ]
+		if ( isSimpleValue( raw ) && !len( raw ) ) {
+			return ""
+		}
+		if ( !isSimpleValue( raw ) || !reFind( "^[1-9][0-9]{0,18}$", toString( raw ) ) ) {
+			ApiError::badRequest( "#arguments.name# must be a positive integer or null" )
+		}
+		return raw
+	}
+
+	static string function requiredString( required struct payload, required string name, numeric maxLength = 1024 ) {
+		var raw = arguments.payload[ arguments.name ] ?: ""
+		if ( !isSimpleValue( raw ) || !len( trim( raw ) ) ) {
+			ApiError::badRequest( "#arguments.name# is required" )
+		}
+		if ( len( trim( raw ) ) > arguments.maxLength ) {
+			ApiError::badRequest( "#arguments.name# is longer than #arguments.maxLength# characters" )
+		}
+		return trim( raw )
+	}
+
+	/** An ISO 8601 instant as a MySQL UTC datetime string; now when absent. */
+	static string function utcTimestamp( value = "" ) {
+		var instant = ""
+		if ( isNull( arguments.value ) || !len( arguments.value ) ) {
+			instant = createObject( "java", "java.time.Instant" ).now()
+		} else {
+			try {
+				instant = createObject( "java", "java.time.OffsetDateTime" ).parse( toString( arguments.value ) ).toInstant()
+			} catch ( any e ) {
+				ApiError::badRequest( "upTo must be an ISO 8601 timestamp with a zone, e.g. 2026-10-03T15:00:00Z" )
+			}
+		}
+		var formatter = createObject( "java", "java.time.format.DateTimeFormatter" )
+			.ofPattern( "yyyy-MM-dd HH:mm:ss" )
+			.withZone( createObject( "java", "java.time.ZoneOffset" ).UTC )
+		return formatter.format( instant )
+	}
+
+	/** The body as bytes, for a feed whose charset its own declaration decides; empty when there's none. */
+	static function readRawBytes( required req, required numeric limit ) {
+		var stream = arguments.req.bodyStream()
+		if ( isNull( stream ) ) {
+			return createObject( "java", "java.lang.String" ).init( "" ).getBytes()
+		}
+		var bytes = stream.readNBytes( arguments.limit + 1 )
+		if ( arrayLen( bytes ) > arguments.limit ) {
+			throw( type = "Api.TooLarge", message = "Request body exceeds #arguments.limit# bytes" )
+		}
+		return bytes
+	}
+
+	static string function readRawBody( required req, required numeric limit ) {
+		var stream = arguments.req.bodyStream()
+		if ( isNull( stream ) ) {
+			return ""
+		}
+		var bytes = stream.readNBytes( arguments.limit + 1 )
+		if ( arrayLen( bytes ) > arguments.limit ) {
+			throw( type = "Api.TooLarge", message = "Request body exceeds #arguments.limit# bytes" )
+		}
+		return createObject( "java", "java.lang.String" ).init( bytes, "UTF-8" )
+	}
+
+}

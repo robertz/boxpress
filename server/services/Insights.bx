@@ -1,0 +1,194 @@
+/**
+ * Who reads the site, from our own request log (RequestLog): page views by
+ * day, where readers come from, what they search for, which posts they read
+ * and which links are broken.
+ *
+ * Every figure shares one traffic filter: GET requests from people (bots are
+ * marked as rows are written), outside the admin and the API. A page view is
+ * narrower still: a public page answered with a 200.
+ *
+ * Completed days are read from request_log_daily, a per-day summary that
+ * buildMissing() fills in the background; only today is counted from raw
+ * rows. That keeps each figure's cost to a month of summaries and a day of
+ * requests, however busy the site, and the summaries outlive the raw log.
+ */
+class {
+
+	property name="db";
+	property name="siteHost" type="string";
+
+	static {
+		VISITOR = "method = 'GET' AND is_bot = 0 AND path NOT LIKE '/admin%' AND path NOT LIKE '/api/%'"
+		PAGE_VIEW = "status_code = 200 AND ( path IN ( '/', '/tags', '/search', '/authors' )
+			OR path LIKE '/posts/%' OR path LIKE '/tag/%' OR path LIKE '/author/%' OR path LIKE '/page/%' )"
+		TODAY = "requested_at >= UTC_DATE() AND requested_at < DATE_ADD( UTC_DATE(), INTERVAL 1 DAY )"
+		// the paths vulnerability scanners try on every site: dotfiles (not /.well-known), WordPress and
+		// phpMyAdmin locations, and script, config and archive files this site never served
+		NOT_A_PROBE = "NOT (
+			( t.name REGEXP '/[.]' AND t.name NOT LIKE '/.well-known/%' )
+			OR t.name REGEXP '(^|/)(wp|wordpress|wp-[a-z]+|phpmyadmin|pma|cgi-bin|vendor|administrator)(/|$)'
+			OR t.name REGEXP '[.](php[0-9]?|aspx?|jsp|cgi|sql|bak|old|zip|tar|gz|tgz|rar|7z|ya?ml|ini|conf|config|log|pem|key|env)$'
+		)"
+		SUMMARY_DAYS = 31
+	}
+
+	/** siteHost: this site's own host, whose referrals are internal navigation rather than a source. */
+	function init( required db, string siteHost = "" ) {
+		variables.db       = arguments.db
+		variables.siteHost = lcase( arguments.siteHost )
+		return this
+	}
+
+	/** [ { date, views } ] for each of the last `days` days and today, oldest first; quiet days are 0. */
+	array function dailyViews( numeric days = 30 ) {
+		var byDate = {}
+		for ( var row in variables.db.query(
+			"SELECT DATE_FORMAT( log_date, '%Y-%m-%d' ) AS d, hits FROM request_log_daily
+			WHERE kind = 'pageviews' AND log_date >= DATE_SUB( UTC_DATE(), INTERVAL ? DAY ) AND log_date < UTC_DATE()",
+			[ arguments.days ],
+			{ returnType: "array" }
+		) ) {
+			byDate[ row.d ] = row.hits
+		}
+		var today = variables.db.query( "SELECT DATE_FORMAT( UTC_DATE(), '%Y-%m-%d' ) AS d" ).d
+		byDate[ today ] = variables.db.query( "SELECT COUNT(*) AS n FROM request_log WHERE #static.TODAY# AND #static.VISITOR# AND #static.PAGE_VIEW#" ).n
+		var result = []
+		var start = createObject( "java", "java.time.LocalDate" ).parse( today )
+		for ( var i = arguments.days; i >= 0; i-- ) {
+			var day = start.minusDays( i ).toString()
+			result.append( { date: day, views: byDate[ day ] ?: 0 } )
+		}
+		return result
+	}
+
+	/** { days, total, previousTotal, today } over the last 30 days, with the 30 before for comparison. */
+	struct function traffic() {
+		var rows = dailyViews( 60 )
+		var cutoff = max( rows.len() - 30, 0 )
+		var days = []
+		var total = 0
+		var previous = 0
+		for ( var i = 1; i <= rows.len(); i++ ) {
+			if ( i <= cutoff ) {
+				previous += rows[ i ].views
+				continue
+			}
+			total += rows[ i ].views
+			days.append( rows[ i ] )
+		}
+		return { days: days, total: total, previousTotal: previous, today: days.len() ? days[ days.len() ].views : 0 }
+	}
+
+	/** Referring hosts ("(direct)" for none), the most first: [ { label, count } ]. */
+	array function topReferrers( numeric days = 30, numeric limit = 10 ) {
+		return variables.db.query(
+			"SELECT CASE WHEN t.name = '' THEN '(direct)' ELSE t.name END AS label, SUM( t.hits ) AS count FROM (
+				SELECT name, hits FROM request_log_daily
+				WHERE kind = 'referrer' AND log_date >= DATE_SUB( UTC_DATE(), INTERVAL ? DAY ) AND log_date < UTC_DATE()
+				UNION ALL
+				SELECT referrer_host AS name, 1 AS hits FROM request_log WHERE #static.TODAY# AND #static.VISITOR# AND #static.PAGE_VIEW#
+			) t
+			WHERE t.name NOT IN ( ?, ? )
+			GROUP BY t.name ORDER BY count DESC LIMIT #int( arguments.limit )#",
+			// with no host configured, nothing is internal; "" itself is a direct visit
+			len( variables.siteHost ) ? [ arguments.days, variables.siteHost, "www." & variables.siteHost ] : [ arguments.days, "-", "-" ],
+			{ returnType: "array" }
+		)
+	}
+
+	/** Missing pages readers asked for, scanners' probes left out: [ { label, count } ]. */
+	array function top404s( numeric days = 30, numeric limit = 10 ) {
+		return variables.db.query(
+			"SELECT t.name AS label, SUM( t.hits ) AS count FROM (
+				SELECT name, hits FROM request_log_daily
+				WHERE kind = '404' AND log_date >= DATE_SUB( UTC_DATE(), INTERVAL ? DAY ) AND log_date < UTC_DATE()
+				UNION ALL
+				SELECT LEFT( path, 500 ) AS name, 1 AS hits FROM request_log WHERE #static.TODAY# AND #static.VISITOR# AND status_code = 404
+			) t
+			WHERE #static.NOT_A_PROBE#
+			GROUP BY t.name ORDER BY count DESC LIMIT #int( arguments.limit )#",
+			[ arguments.days ],
+			{ returnType: "array" }
+		)
+	}
+
+	/** The most-read posts: [ { label, url, count } ]. */
+	array function topPosts( numeric days = 30, numeric limit = 10 ) {
+		return variables.db.query(
+			"SELECT p.title AS label, p.slug, SUM( v.views ) AS count FROM post_views_daily v JOIN posts p ON p.id = v.post_id
+			WHERE v.view_date >= DATE_SUB( UTC_DATE(), INTERVAL ? DAY )
+			GROUP BY p.id ORDER BY count DESC LIMIT #int( arguments.limit )#",
+			[ arguments.days ],
+			{ returnType: "array" }
+		).map( ( r ) => { return { label: r.label, url: "/posts/" & encodeForURL( r.slug ), count: r.count } } )
+	}
+
+	/** What readers searched for: [ { label, count } ]; zeroOnly, only searches that found nothing. */
+	array function topSearches( numeric days = 30, numeric limit = 10, boolean zeroOnly = false ) {
+		return variables.db.query(
+			"SELECT query AS label, COUNT(*) AS count FROM search_log
+			WHERE searched_at >= DATE_SUB( UTC_TIMESTAMP(), INTERVAL ? DAY ) #arguments.zeroOnly ? 'AND result_count = 0' : ''#
+			GROUP BY query ORDER BY count DESC LIMIT #int( arguments.limit )#",
+			[ arguments.days ],
+			{ returnType: "array" }
+		)
+	}
+
+	/**
+	 * Summarizes each completed day of the last `days` that request_log_daily
+	 * hasn't got. A day counts as done once its 'pageviews' row (written last)
+	 * exists, so one interrupted halfway is simply redone. @return days built
+	 */
+	numeric function buildMissing( numeric days = 31 ) {
+		var built = variables.db.query(
+			"SELECT DATE_FORMAT( log_date, '%Y-%m-%d' ) AS d FROM request_log_daily
+			WHERE kind = 'pageviews' AND log_date >= DATE_SUB( UTC_DATE(), INTERVAL ? DAY ) AND log_date < UTC_DATE()",
+			[ arguments.days ],
+			{ returnType: "array" }
+		).map( ( r ) => r.d )
+		// days before the log's first row have nothing to summarize
+		var first = variables.db.query( "SELECT DATE_FORMAT( MIN( requested_at ), '%Y-%m-%d' ) AS d FROM request_log" ).d ?: ""
+		if ( !len( first ) ) {
+			return 0
+		}
+		var today = createObject( "java", "java.time.LocalDate" ).parse( variables.db.query( "SELECT DATE_FORMAT( UTC_DATE(), '%Y-%m-%d' ) AS d" ).d )
+		var count = 0
+		for ( var i = arguments.days; i >= 1; i-- ) {
+			var day = today.minusDays( i ).toString()
+			if ( day >= first && !built.contains( day ) ) {
+				summarize( day )
+				count++
+			}
+		}
+		return count
+	}
+
+	private void function summarize( required string day ) {
+		var range = "requested_at >= ? AND requested_at < DATE_ADD( ?, INTERVAL 1 DAY )"
+		var params = [ arguments.day, arguments.day, arguments.day ]
+		variables.db.execute(
+			"INSERT INTO request_log_daily ( log_date, kind, name, hits )
+			SELECT ?, 'referrer', LEFT( referrer_host, 500 ), COUNT(*) FROM request_log
+			WHERE #range# AND #static.VISITOR# AND #static.PAGE_VIEW#
+			GROUP BY LEFT( referrer_host, 500 )
+			ON DUPLICATE KEY UPDATE hits = VALUES( hits )",
+			params
+		)
+		variables.db.execute(
+			"INSERT INTO request_log_daily ( log_date, kind, name, hits )
+			SELECT ?, '404', LEFT( path, 500 ), COUNT(*) FROM request_log
+			WHERE #range# AND #static.VISITOR# AND status_code = 404
+			GROUP BY LEFT( path, 500 )
+			ON DUPLICATE KEY UPDATE hits = VALUES( hits )",
+			params
+		)
+		variables.db.execute(
+			"INSERT INTO request_log_daily ( log_date, kind, name, hits )
+			SELECT ?, 'pageviews', '', COUNT(*) FROM request_log
+			WHERE #range# AND #static.VISITOR# AND #static.PAGE_VIEW#
+			ON DUPLICATE KEY UPDATE hits = VALUES( hits )",
+			params
+		)
+	}
+
+}

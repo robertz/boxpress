@@ -1,0 +1,136 @@
+/**
+ * Tags: a name as the author typed it (BoxLang, "Web Dev") and a slug for its
+ * page (/tag/boxlang, /tag/web-dev). The same slug is the same tag, so
+ * "boxlang" and "BoxLang" don't become two. A tag no post uses any more is
+ * removed with the post edit that left it unused.
+ */
+class {
+
+	property name="db";
+
+	static {
+		MAX_PER_POST = 10
+		MAX_NAME = 50
+	}
+
+	function init( required db ) {
+		variables.db = arguments.db
+		return this
+	}
+
+	static string function slugOf( required string name ) {
+		var slug = createObject( "java", "java.lang.String" ).init( lcase( trim( arguments.name ) ) )
+			.replaceAll( "[^a-z0-9]+", "-" )
+			.replaceAll( "^-+|-+$", "" )
+		return left( slug, 60 )
+	}
+
+	/** Trimmed, deduplicated by slug, in order. Throws Tags.Invalid for too many or too long. */
+	array function namesOf( required tags ) {
+		var list = isSimpleValue( arguments.tags ) ? listToArray( arguments.tags, "," ) : arguments.tags
+		var seen  = {}
+		var names = []
+		for ( var raw in list ) {
+			if ( !isSimpleValue( raw ) ) {
+				throw( type = "Tags.Invalid", message = "Tags are text" )
+			}
+			var name = reReplace( trim( raw ), "\s+", " ", "all" )
+			var slug = slugOf( name )
+			if ( !len( slug ) || seen.keyExists( slug ) ) {
+				continue
+			}
+			if ( len( name ) > static.MAX_NAME ) {
+				throw( type = "Tags.Invalid", message = "A tag is at most #static.MAX_NAME# characters" )
+			}
+			seen[ slug ] = true
+			names.append( name )
+		}
+		if ( names.len() > static.MAX_PER_POST ) {
+			throw( type = "Tags.Invalid", message = "A post has at most #static.MAX_PER_POST# tags" )
+		}
+		return names
+	}
+
+	/** Makes these the post's tags, in order. */
+	void function setForPost( required numeric postId, required array names ) {
+		variables.db.execute( "DELETE FROM post_tags WHERE post_id = ?", [ arguments.postId ] )
+		var position = 0
+		for ( var name in arguments.names ) {
+			var slug = slugOf( name )
+			variables.db.execute( "INSERT INTO tags ( name, slug ) VALUES ( ?, ? ) ON DUPLICATE KEY UPDATE id = id", [ name, slug ] )
+			var tagId = variables.db.query( "SELECT id FROM tags WHERE slug = ?", [ slug ] ).id
+			variables.db.execute( "INSERT IGNORE INTO post_tags ( post_id, tag_id, position ) VALUES ( ?, ?, ? )", [ arguments.postId, tagId, position ] )
+			position++
+		}
+		pruneUnused()
+	}
+
+	void function pruneUnused() {
+		variables.db.execute( "DELETE t FROM tags t LEFT JOIN post_tags pt ON pt.tag_id = t.id WHERE pt.tag_id IS NULL" )
+	}
+
+	/** { postId: [ { name, slug } ] } for these posts, each in its own order. */
+	struct function forPosts( required array postIds ) {
+		var result = {}
+		if ( !arguments.postIds.len() ) {
+			return result
+		}
+		var rows = variables.db.query(
+			"SELECT pt.post_id, t.name, t.slug FROM post_tags pt JOIN tags t ON t.id = pt.tag_id
+			WHERE pt.post_id IN ( #arguments.postIds.map( () => '?' ).toList()# ) ORDER BY pt.post_id, pt.position",
+			arguments.postIds,
+			{ returnType: "array" }
+		)
+		for ( var r in rows ) {
+			if ( !result.keyExists( r.post_id ) ) {
+				result[ r.post_id ] = []
+			}
+			result[ r.post_id ].append( { name: r.name, slug: r.slug } )
+		}
+		return result
+	}
+
+	/** { id, name, slug } or {}. */
+	struct function bySlug( required string slug ) {
+		var rows = variables.db.query( "SELECT id, name, slug FROM tags WHERE slug = ?", [ arguments.slug ], { returnType: "array" } )
+		return rows.len() ? rows[ 1 ] : {}
+	}
+
+	/** Tags with public posts and how many, the most used first. limit 0 is all of them. */
+	array function popular( numeric limit = 0 ) {
+		return variables.db.query(
+			"SELECT t.name, t.slug, COUNT(*) AS posts FROM tags t
+			JOIN post_tags pt ON pt.tag_id = t.id
+			JOIN posts p ON p.id = pt.post_id AND p.status = 'published' AND p.published_at <= UTC_TIMESTAMP()
+			GROUP BY t.id ORDER BY posts DESC, t.name #arguments.limit ? 'LIMIT ' & int( arguments.limit ) : ''#",
+			[],
+			{ returnType: "array" }
+		)
+	}
+
+	/** Every tag, drafts' included, with how many posts: for the editor's suggestions and Admin > Tags. */
+	array function all() {
+		return variables.db.query(
+			"SELECT t.id, t.name, t.slug, COUNT(pt.post_id) AS posts FROM tags t
+			LEFT JOIN post_tags pt ON pt.tag_id = t.id GROUP BY t.id ORDER BY t.name",
+			[],
+			{ returnType: "array" }
+		)
+	}
+
+	/** Renames a tag (its slug follows the name). Throws Tags.Conflict when another tag already has that slug. */
+	struct function rename( required numeric id, required string name ) {
+		var names = namesOf( [ arguments.name ] )
+		if ( !names.len() ) {
+			throw( type = "Tags.Invalid", message = "A tag needs a name" )
+		}
+		var slug = slugOf( names[ 1 ] )
+		var holder = bySlug( slug )
+		if ( !holder.isEmpty() && holder.id != arguments.id ) {
+			throw( type = "Tags.Conflict", message = "There's already a tag ""#holder.name#""" )
+		}
+		variables.db.execute( "UPDATE tags SET name = ?, slug = ? WHERE id = ?", [ names[ 1 ], slug, arguments.id ] )
+		return bySlug( slug )
+	}
+
+}

@@ -1,0 +1,72 @@
+/**
+ * boxlang scripts/users.bxs add <username> <email> [--admin]   (prompts for the password)
+ * boxlang scripts/users.bxs role <username> admin|author
+ * boxlang scripts/users.bxs password <username>              (prompts for the new password)
+ * boxlang scripts/users.bxs passkeys-clear <username>        (for someone who lost theirs)
+ * boxlang scripts/users.bxs hash                             (for BOXPRESS_ADMIN_PASSWORD_HASH)
+ * boxlang scripts/users.bxs rerender                         (every post's HTML, from its Markdown)
+ * Run from server/.
+ */
+import services.Bootstrap;
+
+// the script's own path comes first
+args = cliGetArgs().positionals.filter( ( a, i ) => i > 1 || !a.endsWith( ".bxs" ) )
+command = args[ 1 ] ?: ""
+
+readPassword = () => {
+	var console = createObject( "java", "java.lang.System" ).console()
+	if ( isNull( console ) ) {
+		println( "No terminal to read a password from" )
+		createObject( "java", "java.lang.System" ).exit( 1 )
+	}
+	return toString( console.readPassword( "Password: " ) )
+}
+
+if ( command == "hash" ) {
+	println( bcryptHash( readPassword() ) )
+	return
+}
+
+svc = Bootstrap::build( Bootstrap::loadSettings() )
+svc.migrator.run()
+
+findUser = ( name ) => {
+	var found = svc.users.findByUsername( name )
+	if ( found.isEmpty() ) {
+		println( "No such user: #name#" )
+	}
+	return found
+}
+
+switch ( command ) {
+	case "add":
+		user = svc.users.create( args[ 2 ] ?: "", readPassword(), cliGetArgs().options.keyExists( "admin" ) ? "admin" : "author", args[ 3 ] ?: "" )
+		println( "Created #user.username# (#user.role#)" )
+		break
+	case "role":
+		user = findUser( args[ 2 ] ?: "" )
+		if ( !user.isEmpty() ) {
+			svc.users.setRole( user.id, args[ 3 ] ?: "" )
+			println( "#user.username# is now an #args[ 3 ]#" )
+		}
+		break
+	case "password":
+		user = findUser( args[ 2 ] ?: "" )
+		if ( !user.isEmpty() ) {
+			svc.users.setPassword( user.id, readPassword() )
+			println( "Set #user.username#'s password; their other sessions are signed out" )
+		}
+		break
+	// a lost passkey: the account signs in by password again and adds a new one
+	case "passkeys-clear":
+		user = findUser( args[ 2 ] ?: "" )
+		if ( !user.isEmpty() ) {
+			println( "Removed #svc.passkeys.removeAll( user.id )# passkeys from #user.username#" )
+		}
+		break
+	case "rerender":
+		println( "Rendered #svc.posts.rerenderAll()# posts" )
+		break
+	default:
+		println( "Usage: boxlang scripts/users.bxs add <username> <email> [--admin] | role <username> admin|author | password <username> | passkeys-clear <username> | hash | rerender" )
+}

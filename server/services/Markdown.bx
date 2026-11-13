@@ -1,0 +1,145 @@
+/**
+ * A post's Markdown as the HTML the site shows: bx-markdown converts it,
+ * Sanitizer cleans it, and then the result is shaped for reading: images
+ * load lazily and stand in a <figure>
+ * with a caption, headings keep their anchor ids, outside links open in a
+ * new tab, code blocks keep only their language class, and wide tables
+ * scroll on their own. Done once per save; posts.body_html holds the result.
+ *
+ * An image's title sets its size and caption: ![alt](src "wide"),
+ * "half", "inline" (no figure), "caption: text", or "wide | text".
+ * Without a caption, the alt text is the caption.
+ */
+class {
+
+	property name="sanitizer";
+
+	static {
+		WORDS_PER_MINUTE = 220
+		SIZES = [ "wide", "half", "inline" ]
+	}
+
+	function init( required sanitizer ) {
+		variables.sanitizer = arguments.sanitizer
+		return this
+	}
+
+	/**
+	 * { html, text, summary, readingMinutes, hasCode }: summary is the text of
+	 * the top-level paragraphs alone, for an excerpt. siteHost is this site's own host
+	 * (example.com), whose links stay in the same tab.
+	 */
+	struct function render( string source = "", string siteHost = "" ) {
+		if ( !len( trim( arguments.source ) ) ) {
+			return { html: "", text: "", summary: "", readingMinutes: 1, hasCode: false }
+		}
+		var body = variables.sanitizer.cleanArticle( markdown( arguments.source ) )
+		headings( body )
+		images( body )
+		links( body, lcase( arguments.siteHost ) )
+		var hasCode = codeBlocks( body )
+		tables( body )
+		var summary = []
+		for ( var paragraph in body.select( "body > p" ).toArray() ) {
+			var words = trim( paragraph.text() )
+			if ( len( words ) ) {
+				summary.append( words )
+			}
+		}
+		var html = variables.sanitizer.render( body )
+		var text = body.text()
+		var words = listLen( text, " #char( 9 )##char( 10 )##char( 13 )#" )
+		return {
+			html           : html,
+			text           : text,
+			summary        : summary.toList( " " ),
+			readingMinutes : max( 1, ceiling( words / static.WORDS_PER_MINUTE ) ),
+			hasCode        : hasCode
+		}
+	}
+
+	/** bx-markdown puts an empty anchor inside each heading; the heading's own id is enough. */
+	private void function headings( required body ) {
+		for ( var anchor in arguments.body.select( "h1 > a:empty, h2 > a:empty, h3 > a:empty, h4 > a:empty, h5 > a:empty, h6 > a:empty" ).toArray() ) {
+			anchor.remove()
+		}
+	}
+
+	private void function images( required body ) {
+		for ( var img in arguments.body.select( "img" ).toArray() ) {
+			var title   = img.attr( "title" )
+			var alt     = img.attr( "alt" )
+			var size    = ""
+			var caption = title
+			for ( var hint in static.SIZES ) {
+				if ( reFindNoCase( "\b#hint#\b", caption ) ) {
+					size    = hint
+					caption = trim( reReplaceNoCase( caption, "\b#hint#\b", "", "all" ) )
+					break
+				}
+			}
+			caption = reFindNoCase( "caption\s*:", caption )
+				? trim( reReplaceNoCase( caption, "^.*?caption\s*:\s*", "" ) )
+				: trim( reReplace( caption, "^[\s|,]+|[\s|,]+$", "", "all" ) )
+			if ( !len( caption ) && size != "inline" ) {
+				caption = alt
+			}
+
+			img.removeAttr( "title" )
+			img.addClass( "post-img" )
+			if ( len( size ) ) {
+				img.addClass( "post-img--#size#" )
+			}
+			img.attr( "loading", "lazy" ).attr( "decoding", "async" )
+			if ( size == "inline" ) {
+				continue
+			}
+
+			// an image alone in its paragraph becomes the figure; one inside text stays where it is
+			var parent = img.parent()
+			var alone  = parent.tagName() == "p" && parent.childrenSize() == 1 && !len( trim( parent.ownText() ) )
+			var figure = alone ? parent.tagName( "figure" ) : img.wrap( "<figure></figure>" ).parent()
+			figure.addClass( "post-figure" )
+			if ( len( size ) ) {
+				figure.addClass( "post-figure--#size#" )
+			}
+			if ( len( caption ) ) {
+				figure.appendElement( "figcaption" ).text( caption )
+			}
+		}
+	}
+
+	private void function links( required body, required string siteHost ) {
+		for ( var link in arguments.body.select( "a[href]" ).toArray() ) {
+			var address = link.attr( "href" )
+			if ( !reFindNoCase( "^https?://", address ) ) {
+				continue
+			}
+			var host = lcase( reReplace( address, "^[a-zA-Z]+://([^/?##:]+).*$", "\1" ) )
+			if ( len( arguments.siteHost ) && ( host == arguments.siteHost || host == "www." & arguments.siteHost ) ) {
+				continue
+			}
+			link.attr( "target", "_blank" ).attr( "rel", "noopener noreferrer" )
+		}
+	}
+
+	/** A code element's class names its language (language-sql), which the page highlights; any other class goes. */
+	private boolean function codeBlocks( required body ) {
+		for ( var code in arguments.body.select( "code[class]" ).toArray() ) {
+			var language = code.attr( "class" ).trim().lcase()
+			if ( reFind( "^language-[a-z0-9+##-]{1,20}$", language ) ) {
+				code.attr( "class", language )
+			} else {
+				code.removeAttr( "class" )
+			}
+		}
+		return arguments.body.select( "pre > code" ).size() > 0
+	}
+
+	private void function tables( required body ) {
+		for ( var table in arguments.body.select( "table" ).toArray() ) {
+			table.wrap( "<div class=""table-scroll""></div>" )
+		}
+	}
+
+}
