@@ -4,8 +4,8 @@
 	<header class="page-header">
 		<h1 class="page-header__title">Search</h1>
 		<form class="search-form" method="get" action="/search" role="search">
-			<label class="visually-hidden" for="search-q">Search posts</label>
-			<input id="search-q" type="search" name="q" value="#encodeForHTMLAttribute( data.query )#" placeholder="Search posts" autofocus>
+			<label class="visually-hidden" for="bp-search-posts">Search posts</label>
+			<input id="bp-search-posts" type="search" name="q" value="#encodeForHTMLAttribute( data.query )#" placeholder="Search posts" autofocus>
 			<button type="submit">Search</button>
 		</form>
 		<bx:if len( data.query )>

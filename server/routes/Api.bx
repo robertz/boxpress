@@ -197,8 +197,10 @@ class {
 				return res.status( status ).json( payload )
 			}
 			var page = status == 404 ? "site/404" : "site/error"
+			// a refusal (400, 403, 429...) keeps its status and says why; anything else is the server's fault
+			var refused = status >= 400 && status < 500 && status != 404
 			try {
-				res.status( status == 404 ? 404 : 500 ).render( page, {
+				res.status( status >= 400 && status < 500 ? status : 500 ).render( page, {
 					site         : site.all(),
 					siteUrl      : siteUrl,
 					currentPath  : req.path,
@@ -207,7 +209,9 @@ class {
 					ogType       : "website",
 					ogImage      : "",
 					robots       : "noindex",
-					pageTitle    : status == 404 ? "Page not found" : "Something went wrong",
+					pageTitle    : status == 404 ? "Page not found" : ( refused ? "That didn't work" : "Something went wrong" ),
+					heading      : refused ? "That didn't work" : "",
+					message      : refused ? message : "",
 					detail       : showInternals && status == 500 ? message : ""
 				} )
 			} catch ( any e ) {

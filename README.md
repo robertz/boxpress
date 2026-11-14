@@ -81,7 +81,9 @@ blog.example.com {
 }
 ```
 
-and set `TRUST_PROXY_HEADER=X-Real-IP` so sign-in rate limits count each visitor rather than the proxy. Only set it when nothing can reach the app except through that proxy.
+The Compose file reads the visitor's address from `X-Real-IP` (`TRUST_PROXY_HEADER`), which the `header_up` line sets; set it to `CF-Connecting-IP` behind Cloudflare. Without it every visitor looks like the proxy, and the sign-in and search limits count them all together. Keep the app bound to `127.0.0.1`, so nothing can reach it, and forge the header, except through the proxy.
+
+Sign-in limits: `MAX_LOGIN_ATTEMPTS` (10) password attempts per address every 15 minutes, and five times that many wrong passwords per account, from any address. A correct password never counts, and passkeys sign in on a limit of their own, so an account under attack can still be used.
 
 Uploaded images go in the `uploads` volume, served at `/uploads`, unless an S3-compatible bucket is configured (`S3_*` in `.env`: Cloudflare R2, AWS S3, MinIO or Backblaze B2), in which case they're served from `S3_PUBLIC_BASE_URL`.
 

@@ -32,10 +32,16 @@ class {
 		var maxPage  = static.MAX_PAGE
 		var searchesPerMinute = arguments.svc.settings.limits.searchesPerMinute ?: 30
 
-		// what every page's layout needs
+		var pageNumber = ( req ) => {
+			var raw = req.query.page ?: ""
+			return isSimpleValue( raw ) && isNumeric( raw ) && raw >= 1 ? min( int( raw ), maxPage ) : 1
+		}
+
+		// what every page's layout needs. Page 2 on of a listing is its own address, so its own canonical one
 		var page = ( req, struct data ) => {
 			var settings = site.all()
-			var canonical = siteUrl & req.path
+			var listingPage = pageNumber( req )
+			var canonical = siteUrl & req.path & ( listingPage > 1 ? "?page=" & listingPage : "" )
 			var description = data.description ?: ( len( settings.description ) ? settings.description : settings.tagline )
 			return {
 				site         : settings,
@@ -47,11 +53,6 @@ class {
 				ogImage      : SiteRoutes::absoluteUrl( siteUrl, settings.socialImage ),
 				robots       : "index,follow"
 			}.append( data )
-		}
-
-		var pageNumber = ( req ) => {
-			var raw = req.query.page ?: ""
-			return isNumeric( raw ) && raw >= 1 ? min( int( raw ), maxPage ) : 1
 		}
 
 		// past the last page (a stale link): the last real one, rather than an empty page at a misleading address
@@ -156,15 +157,23 @@ class {
 			res.render( "site/authors", page( req, { pageTitle: "Authors", authors: users.authorsWithPosts() } ) )
 		} )
 
-		// each search is a full-text query, and an unmatched one a scan of every post
-		var searchLimiter = boxExpressRateLimit( {
-			windowMs : 60 * 1000,
-			max      : searchesPerMinute,
-			message  : "That's a lot of searches. Try again in a minute."
-		} )
+		// each search is a full-text query, and an unmatched one a scan of every post. Counted here
+		// rather than by boxExpressRateLimit, so the reader gets the site's own page, not JSON
+		var searches = new services.Throttle( 60 * 1000, searchesPerMinute )
 
-		arguments.app.get( "/search", searchLimiter, ( req, res ) => {
+		arguments.app.get( "/search", ( req, res ) => {
 			var q = left( trim( isSimpleValue( req.query.q ?: "" ) ? ( req.query.q ?: "" ) : "" ), 200 )
+			var visitor = "search:" & req.ip
+			if ( len( q ) && !searches.take( visitor ) ) {
+				res.set( "Retry-After", toString( searches.retryAfter( visitor ) ) )
+				return res.status( 429 ).render( "site/error", page( req, {
+					pageTitle : "Too many searches",
+					heading   : "Too many searches",
+					message   : "That's a lot of searches in a minute. Try again shortly.",
+					query     : q,
+					robots    : "noindex"
+				} ) )
+			}
 			var paging = len( q )
 				? posts.search( q, pageNumber( req ), site.all().postsPerPage, !bots.isBot( req.get( "User-Agent" ) ?: "" ) )
 				: { posts: [], total: 0, page: 1, pageSize: 10, totalPages: 0 }

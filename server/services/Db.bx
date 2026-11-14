@@ -22,4 +22,19 @@ class {
 		return result
 	}
 
+	/**
+	 * Runs work() in one transaction and answers what it returns ("" for
+	 * nothing): committed when it finishes, rolled back if it throws. The
+	 * transaction takes this datasource from work's first query.
+	 */
+	function transaction( required work ) {
+		var task = arguments.work
+		var outcome = ""
+		transaction {
+			var answered = task()
+			outcome = isNull( answered ) ? "" : answered
+		}
+		return outcome
+	}
+
 }

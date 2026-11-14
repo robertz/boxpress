@@ -51,18 +51,22 @@ class {
 		return names
 	}
 
-	/** Makes these the post's tags, in order. */
+	/**
+	 * Makes these the post's tags, in order. It leaves a tag the post no longer
+	 * uses: the caller prunes once the post's save has committed, since a prune
+	 * on the way would delete a tag another save has added but not yet linked.
+	 */
 	void function setForPost( required numeric postId, required array names ) {
 		variables.db.execute( "DELETE FROM post_tags WHERE post_id = ?", [ arguments.postId ] )
 		var position = 0
 		for ( var name in arguments.names ) {
 			var slug = slugOf( name )
 			variables.db.execute( "INSERT INTO tags ( name, slug ) VALUES ( ?, ? ) ON DUPLICATE KEY UPDATE id = id", [ name, slug ] )
-			var tagId = variables.db.query( "SELECT id FROM tags WHERE slug = ?", [ slug ] ).id
+			// a locking read: inside a transaction a plain one wouldn't see a tag another save has just added
+			var tagId = variables.db.query( "SELECT id FROM tags WHERE slug = ? FOR SHARE", [ slug ] ).id
 			variables.db.execute( "INSERT IGNORE INTO post_tags ( post_id, tag_id, position ) VALUES ( ?, ?, ? )", [ arguments.postId, tagId, position ] )
 			position++
 		}
-		pruneUnused()
 	}
 
 	void function pruneUnused() {

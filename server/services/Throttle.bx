@@ -1,0 +1,71 @@
+/**
+ * A fixed-window counter per key, in memory, for limits the route decides
+ * when to count: failed sign-ins only (so a correct password never adds to
+ * an account's count), or a public page that answers with the site's own
+ * 429 page rather than BoxExpress's JSON.
+ */
+class {
+
+	property name="entries";
+	property name="windowMs" type="numeric";
+	property name="limit" type="numeric";
+	property name="hitsSinceSweep" type="numeric";
+
+	function init( required numeric windowMs, required numeric limit ) {
+		variables.entries        = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init()
+		variables.windowMs       = arguments.windowMs
+		variables.limit          = arguments.limit
+		variables.hitsSinceSweep = 0
+		return this
+	}
+
+	/** Whether the key is under its limit, without counting this call. */
+	boolean function allowed( required string key ) {
+		var entry = variables.entries.get( arguments.key )
+		return isNull( entry ) || entry.resetAt <= nowMs() || entry.count < variables.limit
+	}
+
+	/** Counts one for the key. @return whether it was still within the limit */
+	boolean function take( required string key ) {
+		var startedAt = nowMs()
+		var windowMs = variables.windowMs
+		// compute() is atomic per key: concurrent requests can't both read the same count
+		var entry = variables.entries.compute( arguments.key, ( mapKey, current ) => {
+			if ( isNull( current ) || current.resetAt <= startedAt ) {
+				return { count: 1, resetAt: startedAt + windowMs }
+			}
+			return { count: current.count + 1, resetAt: current.resetAt }
+		} )
+		variables.hitsSinceSweep++
+		if ( variables.hitsSinceSweep >= 1000 ) {
+			variables.hitsSinceSweep = 0
+			sweep()
+		}
+		return entry.count <= variables.limit
+	}
+
+	void function clear( required string key ) {
+		variables.entries.remove( arguments.key )
+	}
+
+	/** Seconds until the key's window ends. */
+	numeric function retryAfter( required string key ) {
+		var entry = variables.entries.get( arguments.key )
+		return isNull( entry ) ? 0 : max( 0, ceiling( ( entry.resetAt - nowMs() ) / 1000 ) )
+	}
+
+	private void function sweep() {
+		var cutoff = nowMs()
+		for ( var key in variables.entries.keySet().toArray() ) {
+			var entry = variables.entries.get( key )
+			if ( !isNull( entry ) && entry.resetAt <= cutoff ) {
+				variables.entries.remove( key )
+			}
+		}
+	}
+
+	private numeric function nowMs() {
+		return createObject( "java", "java.lang.System" ).currentTimeMillis()
+	}
+
+}

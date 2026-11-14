@@ -42,7 +42,7 @@
 </bx:if>
 </head>
 <body>
-<a class="skip-link" href="##main">Skip to content</a>
+<a class="skip-link" href="##bp-main">Skip to content</a>
 <header class="site-header">
 	<div class="wrap site-header__inner">
 		<a href="/" class="site-title">#encodeForHTML( data.site.title )#</a>
@@ -52,10 +52,10 @@
 			<a href="/authors" #data.currentPath == "/authors" || left( data.currentPath, 8 ) == "/author/" ? 'aria-current="page"' : ''#>Authors</a>
 		</nav>
 		<form class="site-search" method="get" action="/search" role="search">
-			<label class="visually-hidden" for="site-search-q">Search</label>
-			<input id="site-search-q" type="search" name="q" placeholder="Search" value="#encodeForHTMLAttribute( data.query ?: "" )#">
+			<label class="visually-hidden" for="bp-site-search">Search</label>
+			<input id="bp-site-search" type="search" name="q" placeholder="Search" value="#encodeForHTMLAttribute( data.query ?: "" )#">
 		</form>
 	</div>
 </header>
-<main id="main" tabindex="-1">
+<main id="bp-main" tabindex="-1">
 </bx:output>

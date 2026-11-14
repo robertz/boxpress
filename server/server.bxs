@@ -25,6 +25,10 @@ if ( svc.users.count() == 0 ) {
 	println( "No accounts yet. Create the first admin with: boxlang scripts/users.bxs add <username> <email> --admin" )
 }
 
+if ( settings.server.production && !len( settings.server.trustProxyHeader ) ) {
+	println( "[rate limits] TRUST_PROXY_HEADER isn't set. Behind a proxy every visitor shares its address, and one person's sign-in attempts or searches use up everyone's. Name the header your proxy sets (X-Real-IP, CF-Connecting-IP)." )
+}
+
 if ( isInstanceOf( svc.storage, "services.LocalStorage" ) ) {
 	println( "[media] No S3 bucket configured: uploads go to #svc.storage.getDirectory()#" )
 }

@@ -124,10 +124,16 @@ class {
 		return arguments.rows.len()
 	}
 
-	/** Removes requests and searches older than keepDays (daily summaries stay). @return requests removed */
+	/**
+	 * Removes requests, searches and the daily referrer and 404 summaries
+	 * older than keepDays. Each day's page-view total stays: one row a day.
+	 * @return requests removed
+	 */
 	numeric function prune() {
 		var days = [ { value: variables.keepDays, sqltype: "integer" } ]
 		variables.db.execute( "DELETE FROM search_log WHERE searched_at < DATE_SUB( UTC_TIMESTAMP(), INTERVAL ? DAY )", days )
+		// every distinct path a scanner tries is a 404 row of its own, day after day
+		variables.db.execute( "DELETE FROM request_log_daily WHERE kind <> 'pageviews' AND log_date < DATE_SUB( UTC_DATE(), INTERVAL ? DAY )", days )
 		return variables.db.execute( "DELETE FROM request_log WHERE requested_at < DATE_SUB( UTC_TIMESTAMP(), INTERVAL ? DAY )", days ).recordCount
 	}
 

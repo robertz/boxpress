@@ -22,8 +22,8 @@
 	</bx:if>
 
 	<bx:if data.paging.page == 1 && data.topTags.len()>
-	<section class="topics" aria-labelledby="topics-heading">
-		<h2 id="topics-heading" class="section-heading">Topics</h2>
+	<section class="topics" aria-labelledby="bp-topics-heading">
+		<h2 id="bp-topics-heading" class="section-heading">Topics</h2>
 		<p class="tag-cloud">
 		<bx:loop array="#data.topTags#" item="tag">
 			<a href="/tag/#encodeForURL( tag.slug )#" class="tag-pill">#encodeForHTML( tag.name )# <span>#tag.posts#</span></a>

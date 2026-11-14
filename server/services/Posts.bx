@@ -75,16 +75,6 @@ class {
 		return rows.len() ? withTags( rows )[ 1 ] : {}
 	}
 
-	/** Any post by slug, public or not, for an author's preview. */
-	struct function anyBySlug( required string slug ) {
-		var rows = variables.db.query(
-			"SELECT #static.COLUMNS#, p.body_html FROM posts p JOIN users u ON u.id = p.author_id WHERE p.slug = ?",
-			[ arguments.slug ],
-			{ returnType: "array" }
-		)
-		return rows.len() ? withTags( rows )[ 1 ] : {}
-	}
-
 	/** { newer, older }: the public posts either side of this one, each { title, url } or {}. */
 	struct function neighbours( required struct post ) {
 		return {
@@ -224,26 +214,31 @@ class {
 
 	/**
 	 * { title, body, slug?, excerpt?, coverImage?, tags?, status?, publishedAt?, featured? }.
-	 * Answers the post as get() does. Throws Posts.Invalid.
+	 * Answers the post as get() does. Throws Posts.Invalid. The post, its tags
+	 * and its first revision are saved together, or not at all.
 	 */
 	struct function create( required numeric authorId, required struct payload ) {
 		var fields = fieldsOf( arguments.payload, {} )
 		var rendered = variables.markdown.render( fields.body, variables.siteHost )
-		var id = variables.db.execute(
-			"INSERT INTO posts ( author_id, title, slug, excerpt, body, body_html, cover_image, status, published_at, featured, reading_minutes )
-			VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )",
-			[
-				arguments.authorId, fields.title, uniqueSlug( fields.slug ), excerptOf( fields.excerpt, rendered.summary ),
-				fields.body, rendered.html, nullable( fields.coverImage ), fields.status,
-				nullable( fields.publishedAt ), fields.featured ? 1 : 0, rendered.readingMinutes
-			]
-		).generatedKey
-		variables.tags.setForPost( id, fields.tags )
-		variables.revisions.snapshot( id, arguments.authorId )
+		var authorId = arguments.authorId
+		var excerpt = excerptOf( fields.excerpt, rendered.summary )
+		var id = variables.db.transaction( () => {
+			var newId = withFreeSlug( fields.slug, 0, ( slug ) => variables.db.execute(
+				"INSERT INTO posts ( author_id, title, slug, excerpt, body, body_html, cover_image, status, published_at, featured, reading_minutes )
+				VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )",
+				[
+					authorId, fields.title, slug, excerpt, fields.body, rendered.html, nullable( fields.coverImage ), fields.status,
+					nullable( fields.publishedAt ), fields.featured ? 1 : 0, rendered.readingMinutes
+				]
+			).generatedKey )
+			variables.tags.setForPost( newId, fields.tags )
+			variables.revisions.snapshot( newId, authorId )
+			return newId
+		} )
 		return get( id )
 	}
 
-	/** The same fields as create(), any of them; those left out keep their value. */
+	/** The same fields as create(), any of them; those left out keep their value. Saved together, as create() is. */
 	struct function update( required numeric id, required numeric editorId, required struct payload ) {
 		var current = get( arguments.id )
 		if ( current.isEmpty() ) {
@@ -251,18 +246,28 @@ class {
 		}
 		var fields = fieldsOf( arguments.payload, current )
 		var rendered = variables.markdown.render( fields.body, variables.siteHost )
-		var slug = compare( fields.slug, current.slug ) == 0 ? current.slug : uniqueSlug( fields.slug, arguments.id )
-		variables.db.execute(
+		var postId = arguments.id
+		var editorId = arguments.editorId
+		var excerpt = excerptOf( fields.excerpt, rendered.summary )
+		var write = ( slug ) => variables.db.execute(
 			"UPDATE posts SET title = ?, slug = ?, excerpt = ?, body = ?, body_html = ?, cover_image = ?, status = ?, published_at = ?,
 				featured = ?, reading_minutes = ? WHERE id = ?",
 			[
-				fields.title, slug, excerptOf( fields.excerpt, rendered.summary ), fields.body, rendered.html,
-				nullable( fields.coverImage ), fields.status, nullable( fields.publishedAt ),
-				fields.featured ? 1 : 0, rendered.readingMinutes, arguments.id
+				fields.title, slug, excerpt, fields.body, rendered.html, nullable( fields.coverImage ), fields.status,
+				nullable( fields.publishedAt ), fields.featured ? 1 : 0, rendered.readingMinutes, postId
 			]
 		)
-		variables.tags.setForPost( arguments.id, fields.tags )
-		variables.revisions.snapshot( arguments.id, arguments.editorId )
+		var keepSlug = compare( fields.slug, current.slug ) == 0
+		variables.db.transaction( () => {
+			if ( keepSlug ) {
+				write( current.slug )
+			} else {
+				withFreeSlug( fields.slug, postId, write )
+			}
+			variables.tags.setForPost( postId, fields.tags )
+			variables.revisions.snapshot( postId, editorId )
+		} )
+		variables.tags.pruneUnused()
 		return get( arguments.id )
 	}
 
@@ -510,15 +515,35 @@ class {
 		return reReplace( left( words, static.AUTO_EXCERPT ), "\s+\S*$", "" ) & "…"
 	}
 
-	/** The slug, or it with -2, -3... when another post has it. */
-	private string function uniqueSlug( required string slug, numeric exceptId = 0 ) {
-		var candidate = arguments.slug
-		var n = 1
+	/** The slug, or it with -2, -3... (from `from` up) when another post has it. */
+	private string function uniqueSlug( required string slug, numeric exceptId = 0, numeric from = 1 ) {
+		var n = arguments.from
+		var candidate = n > 1 ? left( arguments.slug, 195 ) & "-" & n : arguments.slug
 		while ( variables.db.query( "SELECT COUNT(*) AS n FROM posts WHERE slug = ? AND id <> ?", [ candidate, arguments.exceptId ] ).n ) {
 			n++
 			candidate = left( arguments.slug, 195 ) & "-" & n
 		}
 		return candidate
+	}
+
+	/**
+	 * Calls write( slug ) with a free slug and answers what it does. Another
+	 * save can take the same slug between the check and the write: the unique
+	 * key refuses the second, which then tries the next number.
+	 */
+	private function withFreeSlug( required string slug, required numeric exceptId, required write ) {
+		var from = 1
+		for ( var attempt = 1; attempt <= 5; attempt++ ) {
+			var candidate = uniqueSlug( arguments.slug, arguments.exceptId, from )
+			try {
+				return arguments.write( candidate )
+			} catch ( any e ) {
+				if ( attempt == 5 || !findNoCase( "posts_slug", ( e.message ?: "" ) & " " & ( e.detail ?: "" ) ) ) {
+					rethrow;
+				}
+				from = candidate == arguments.slug ? 2 : val( listLast( candidate, "-" ) ) + 1
+			}
+		}
 	}
 
 	/** An ISO 8601 instant (2026-11-13T15:00:00Z, or with an offset) as a MySQL UTC datetime. Throws Posts.Invalid. */

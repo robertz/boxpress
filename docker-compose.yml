@@ -22,6 +22,9 @@ services:
     environment:
       ENV: production
       PORT: "8080"
+      # the visitor's address, as the proxy in front reports it: without it every visitor
+      # looks like the proxy, and the rate limits count them all together
+      TRUST_PROXY_HEADER: ${TRUST_PROXY_HEADER:-X-Real-IP}
       BOXPRESS_DB_HOST: db
       BOXPRESS_DB_PORT: "3306"
       BOXPRESS_DB_NAME: ${MYSQL_DATABASE:-boxpress}

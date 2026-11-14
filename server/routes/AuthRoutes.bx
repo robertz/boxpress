@@ -19,18 +19,17 @@ class {
 			max      : maxAttempts,
 			message  : "Too many sign-in attempts. Try again in a few minutes."
 		} )
-		// guesses spread over many addresses still count against the account
-		var accountLimiter = boxExpressRateLimit( {
-			windowMs     : 15 * 60 * 1000,
-			max          : maxAttempts,
-			message      : "Too many sign-in attempts. Try again in a few minutes.",
-			keyGenerator : ( req ) => {
-				var name = isStruct( req.body ) ? ( req.body.username ?: "" ) : ""
-				var typed = lcase( trim( isSimpleValue( name ) ? name : "" ) )
-				var account = users.findForLogin( typed )
-				return account.isEmpty() ? "login:" & typed : "login:##" & account.id
-			}
+		// a passkey answer can't be guessed, so signing in with one gets more room than a password;
+		// it isn't free, though: each answer is a signature check
+		var passkeyLimiter = boxExpressRateLimit( {
+			windowMs : 15 * 60 * 1000,
+			max      : maxAttempts * 6,
+			message  : "Too many sign-in attempts. Try again in a few minutes."
 		} )
+		// wrong passwords spread over many addresses still count against the account. Only
+		// failures count, and more of them than from one address, so it takes a determined
+		// effort to lock someone out, and their passkeys still sign them in when it does
+		var failedLogins = new services.Throttle( 15 * 60 * 1000, maxAttempts * 5 )
 
 		/** The admin app calls this first: who is signed in, the site's name, and the CSRF token. */
 		arguments.router.get( "/auth/session", ( req, res ) => {
@@ -45,14 +44,22 @@ class {
 		} )
 
 		/** { username, password }: `username` may be the account's username or its email. */
-		arguments.router.post( "/auth/login", loginLimiter, accountLimiter, ( req, res ) => {
+		arguments.router.post( "/auth/login", loginLimiter, ( req, res ) => {
 			var payload  = Http::body( req )
 			var username = isSimpleValue( payload.username ?: "" ) ? ( payload.username ?: "" ) : ""
 			var password = isSimpleValue( payload.password ?: "" ) ? ( payload.password ?: "" ) : ""
-			var user     = users.verify( username, password )
+			var account  = users.findForLogin( username )
+			var accountKey = account.isEmpty() ? "login:" & lcase( trim( username ) ) : "login:##" & account.id
+			if ( !failedLogins.allowed( accountKey ) ) {
+				res.set( "Retry-After", toString( failedLogins.retryAfter( accountKey ) ) )
+				ApiError::tooMany( "Too many wrong passwords for this account. Try again in a few minutes, or sign in with a passkey." )
+			}
+			var user = users.verify( username, password )
 			if ( user.isEmpty() ) {
+				failedLogins.take( accountKey )
 				ApiError::unauthorized( "Wrong email, username or password" )
 			}
+			failedLogins.clear( accountKey )
 			// the published default password would let anyone in, and on to adding their own passkey
 			if ( production && users.isDefaultLogin( user, password ) ) {
 				ApiError::forbidden( "The default admin password can't be used in production. Set a new one on the server: boxlang scripts/users.bxs password admin" )
@@ -65,14 +72,14 @@ class {
 		 * The challenge for signing in with a passkey, or with { confirm: true }
 		 * for confirming the signed-in account (only its passkeys are offered).
 		 */
-		arguments.router.post( "/auth/passkey/options", loginLimiter, ( req, res ) => {
+		arguments.router.post( "/auth/passkey/options", passkeyLimiter, ( req, res ) => {
 			var payload = Http::body( req )
 			var user = ( payload.confirm ?: false ) == true ? users.fromSession( req.session ) : {}
 			res.json( passkeys.signInOptions( req.session, user.isEmpty() ? 0 : user.id ) )
 		} )
 
 		/** { id, clientDataJSON, authenticatorData, signature }: the browser's answer to the options above. */
-		arguments.router.post( "/auth/passkey/login", loginLimiter, ( req, res ) => {
+		arguments.router.post( "/auth/passkey/login", passkeyLimiter, ( req, res ) => {
 			var checked = {}
 			try {
 				checked = passkeys.verify( req.session, Http::body( req ) )

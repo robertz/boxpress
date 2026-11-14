@@ -356,6 +356,104 @@ class extends="testbox.system.BaseSpec" {
 					expect( svc.markdown.render( '![x](/a.png "inline")' ).html ).notToInclude( "<figure" )
 				} )
 			} )
+
+			describe( "Second review fixes", () => {
+
+				it( "counts only what it's told to, per key, and forgets a key when cleared", () => {
+					var throttle = new services.Throttle( 60000, 2 )
+					expect( throttle.allowed( "a" ) ).toBeTrue()
+					expect( throttle.take( "a" ) ).toBeTrue()
+					expect( throttle.take( "a" ) ).toBeTrue()
+					expect( throttle.allowed( "a" ) ).toBeFalse()
+					expect( throttle.take( "a" ) ).toBeFalse()
+					expect( throttle.allowed( "b" ) ).toBeTrue()
+					expect( throttle.retryAfter( "a" ) ).toBeGT( 0 )
+					throttle.clear( "a" )
+					expect( throttle.allowed( "a" ) ).toBeTrue()
+				} )
+
+				it( "keeps passkey sign-in requests off the password sign-in limit", () => {
+					var strict = TestSupport::services( { auth: { maxLoginAttempts: 2 } } )
+					var strictApp = Api::build( strict )
+					strictApp.listen( port = 4934, options = { block: false } )
+					try {
+						var browser = new ApiClient( "http://127.0.0.1:4934" )
+						browser.startSession()
+						for ( var i = 1; i <= 3; i++ ) {
+							expect( browser.post( "/api/auth/passkey/options", {} ).status ).toBe( 200 )
+						}
+						expect( browser.login( TestSupport::ADMIN_USER, TestSupport::TEST_PASSWORD ).status ).toBe( 200 )
+					} finally {
+						strictApp.close()
+					}
+				} )
+
+				it( "saves a post, its tags and its revision together, or none of them", () => {
+					var failing = {
+						snapshot : ( postId, userId ) => {
+							throw( type = "Probe.Failed", message = "revision store down" )
+						}
+					}
+					var fragile = new services.Posts( svc.db, svc.markdown, svc.tags, failing, svc.users, "" )
+					expect( () => fragile.create( TestSupport::userId( svc ), { title: "Half saved", body: "x", tags: [ "Orphan" ] } ) ).toThrow( "Probe.Failed" )
+					expect( svc.db.query( "SELECT COUNT(*) AS n FROM posts" ).n ).toBe( 0 )
+					expect( svc.db.query( "SELECT COUNT(*) AS n FROM tags" ).n ).toBe( 0 )
+
+					var saved = svc.posts.create( TestSupport::userId( svc ), { title: "Whole", body: "x", tags: [ "Kept" ] } )
+					expect( () => fragile.update( saved.id, TestSupport::userId( svc ), { title: "Changed", tags: [ "Other" ] } ) ).toThrow( "Probe.Failed" )
+					var after = svc.posts.get( saved.id )
+					expect( after.title ).toBe( "Whole" )
+					expect( after.tags.map( ( t ) => t.name ) ).toBe( [ "Kept" ] )
+				} )
+
+				it( "prunes old referrer and 404 summaries, and keeps each day's page views", () => {
+					for ( var kind in [ "pageviews", "404", "referrer" ] ) {
+						svc.db.execute(
+							"INSERT INTO request_log_daily ( log_date, kind, name, hits ) VALUES ( DATE_SUB( UTC_DATE(), INTERVAL 400 DAY ), ?, ?, 1 )",
+							[ kind, kind == "pageviews" ? "" : "/wp-login.php" ]
+						)
+					}
+					svc.requestLog.prune()
+					expect( svc.db.query( "SELECT kind FROM request_log_daily", [], { returnType: "array" } ).map( ( r ) => r.kind ) ).toBe( [ "pageviews" ] )
+				} )
+
+				it( "gives page 2 of a listing its own canonical address", () => {
+					svc.site.save( { postsPerPage: 1 } )
+					try {
+						var admin = signedIn()
+						admin.post( "/api/posts", { title: "First", body: "x", status: "published", publishedAt: "2026-01-01T00:00:00Z" } )
+						admin.post( "/api/posts", { title: "Second", body: "x", status: "published", publishedAt: "2026-01-02T00:00:00Z" } )
+						var reader = new ApiClient( baseUrl )
+						expect( reader.get( "/?page=2" ).body ).toInclude( 'rel="canonical" href="http&##x3a;&##x2f;&##x2f;blog.example.test&##x2f;&##x3f;page&##x3d;2"' )
+						expect( reader.get( "/" ).body ).toInclude( 'rel="canonical" href="http&##x3a;&##x2f;&##x2f;blog.example.test&##x2f;"' )
+					} finally {
+						svc.site.save( { postsPerPage: 10 } )
+					}
+				} )
+
+				it( "answers too many searches with the site's own page", () => {
+					var strict = TestSupport::services( { limits: { searchesPerMinute: 2 } } )
+					var strictApp = Api::build( strict )
+					strictApp.listen( port = 4935, options = { block: false } )
+					try {
+						var reader = new ApiClient( "http://127.0.0.1:4935" )
+						expect( reader.get( "/search?q=one" ).status ).toBe( 200 )
+						expect( reader.get( "/search?q=two" ).status ).toBe( 200 )
+						var refused = reader.get( "/search?q=three" )
+						expect( refused.status ).toBe( 429 )
+						expect( refused.body ).toInclude( "Too many searches" )
+						expect( refused.body ).toInclude( "<html" )
+					} finally {
+						strictApp.close()
+					}
+				} )
+
+				it( "keeps ids on headings only, away from the layout's own", () => {
+					var html = svc.markdown.render( '<p id="bp-main">x</p>' & char( 10 ) & char( 10 ) & "## Main" ).html
+					expect( html ).notToInclude( 'id="bp-main"' )
+					expect( html ).toInclude( ' id="main">Main</h' )
+				} )
+			} )
 		} )
 	}
 
