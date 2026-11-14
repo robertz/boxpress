@@ -30,6 +30,8 @@ export default defineConfig({
 		outDir: "dist",
 		emptyOutDir: true,
 		manifest: true,
+		// fonts stay files: the site's CSP allows fonts from 'self', not data: URLs
+		assetsInlineLimit: (file) => (/\.(woff2?|ttf|otf)$/.test(file) ? false : undefined),
 		rolldownOptions: {
 			input: {
 				admin: "admin.html",

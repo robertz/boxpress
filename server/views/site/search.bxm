@@ -1,26 +1,26 @@
 <bx:include template="_head.bxm">
 <bx:output>
-<div class="wrap">
-	<header class="page-header">
-		<h1 class="page-header__title">Search</h1>
-		<form class="search-form" method="get" action="/search" role="search">
+<div class="wrap wrap--narrow">
+	<header class="page-head">
+		<h1 class="page-head__title">Search</h1>
+		<form class="search-box" method="get" action="/search" role="search">
 			<label class="visually-hidden" for="bp-search-posts">Search posts</label>
-			<input id="bp-search-posts" type="search" name="q" value="#encodeForHTMLAttribute( data.query )#" placeholder="Search posts" autofocus>
-			<button type="submit">Search</button>
+			<input id="bp-search-posts" class="search-box__input" type="search" name="q" value="#encodeForHTMLAttribute( data.query )#" placeholder="Search titles, excerpts and posts" autofocus>
+			<button type="submit" class="search-box__submit">Search</button>
 		</form>
 		<bx:if len( data.query )>
-		<p class="page-header__meta">#data.paging.total# #data.paging.total == 1 ? "result" : "results"# for &ldquo;#encodeForHTML( data.query )#&rdquo;</p>
+		<p class="page-head__lede">#data.paging.total# #data.paging.total == 1 ? "result" : "results"# for &ldquo;#encodeForHTML( data.query )#&rdquo;, most relevant first.</p>
 		</bx:if>
 	</header>
 	<bx:if data.paging.posts.len()>
-	<div class="post-list">
+	<div class="entry-list">
 		<bx:loop array="#data.paging.posts#" item="post">
-			<bx:include template="_postCard.bxm">
+			<bx:include template="_postEntry.bxm">
 		</bx:loop>
 	</div>
 	<bx:include template="_pagination.bxm">
 	<bx:elseif len( data.query )>
-	<p class="empty">Nothing matched. Try fewer or different words.</p>
+	<p class="empty">Nothing matched. Try a different word, or <a href="/">browse everything</a>.</p>
 	</bx:if>
 </div>
 </bx:output>

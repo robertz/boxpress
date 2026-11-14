@@ -1,0 +1,23 @@
+<!--- A featured post: its cover as a thumbnail (or its initial), title, excerpt and byline. Expects `post` (labelled). --->
+<bx:output>
+<article class="feature">
+	<a href="#encodeForHTMLAttribute( post.url )#" class="feature__thumb" tabindex="-1" aria-hidden="true">
+		<bx:if len( post.coverImage )>
+		<img src="#encodeForHTMLAttribute( post.coverImage )#" alt="" width="56" height="56" loading="lazy" decoding="async">
+		<bx:else>
+		<span>#encodeForHTML( uCase( left( post.title, 1 ) ) )#</span>
+		</bx:if>
+	</a>
+	<div class="feature__body">
+		<h3 class="feature__name"><a href="#encodeForHTMLAttribute( post.url )#">#encodeForHTML( post.title )#</a></h3>
+		<bx:if len( post.excerpt )>
+		<p class="feature__pitch">#encodeForHTML( post.excerpt )#</p>
+		</bx:if>
+		<p class="feature__meta">
+			<a href="/author/#encodeForURL( post.author.username )#">#encodeForHTML( post.author.displayName )#</a>
+			<span aria-hidden="true">&middot;</span>
+			<time datetime="#encodeForHTMLAttribute( post.publishedAt )#">#post.shortDateLabel#</time>
+		</p>
+	</div>
+</article>
+</bx:output>

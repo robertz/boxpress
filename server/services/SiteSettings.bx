@@ -33,7 +33,7 @@ class {
 			postsPerPage : 10,
 			footerText   : "",
 			socialImage  : "",
-			accentColor  : "##2563eb",
+			accentColor  : "##4f46e5",
 			language     : "en"
 		}.append( arguments.defaults )
 		return this
@@ -90,7 +90,7 @@ class {
 				break
 			case "color":
 				if ( !reFind( "^##[0-9a-fA-F]{6}$", text ) ) {
-					throw( type = "SiteSettings.Invalid", message = "accentColor must be a colour like ##2563eb" )
+					throw( type = "SiteSettings.Invalid", message = "accentColor must be a colour like ##4f46e5" )
 				}
 				return lcase( text )
 			case "language":

@@ -49,7 +49,7 @@ class {
 
 	/**
 	 * A page of public posts, newest first: { posts, total, page, pageSize, totalPages }.
-	 * filter: { tagId?, authorId? }
+	 * filter: { tagId?, authorId?, featured? }
 	 */
 	struct function publicPage( numeric page = 1, numeric pageSize = 10, struct filter = {} ) {
 		var where  = [ static.PUBLIC ]
@@ -61,6 +61,9 @@ class {
 		if ( val( arguments.filter.authorId ?: 0 ) ) {
 			where.append( "p.author_id = ?" )
 			params.append( arguments.filter.authorId )
+		}
+		if ( arguments.filter.featured ?: false ) {
+			where.append( "p.featured = 1" )
 		}
 		return paged( where.toList( " AND " ), params, "p.published_at DESC, p.id DESC", arguments.page, arguments.pageSize )
 	}

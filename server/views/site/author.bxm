@@ -1,25 +1,31 @@
 <bx:include template="_head.bxm">
 <bx:output>
-<div class="wrap">
-	<header class="page-header author-header">
+<div class="wrap wrap--narrow">
+	<header class="page-head page-head--author">
 		<bx:if len( data.author.avatarUrl )>
-		<img class="author-card__avatar author-card__avatar--large" src="#encodeForHTMLAttribute( data.author.avatarUrl )#" alt="">
+		<img class="avatar avatar--large" src="#encodeForHTMLAttribute( data.author.avatarUrl )#" alt="">
 		<bx:else>
-		<span class="author-card__avatar author-card__avatar--large" aria-hidden="true">#encodeForHTML( data.author.initials )#</span>
+		<span class="avatar avatar--large" aria-hidden="true">#encodeForHTML( data.author.initials )#</span>
 		</bx:if>
 		<div>
-			<p class="page-header__kicker"><a href="/authors">Authors</a></p>
-			<h1 class="page-header__title">#encodeForHTML( data.author.displayName )#</h1>
-			<bx:if len( data.author.bio )><p class="page-header__text">#encodeForHTML( data.author.bio )#</p></bx:if>
-			<bx:if len( data.author.website )><p class="page-header__meta"><a href="#encodeForHTMLAttribute( data.author.website )#" rel="me noopener">#encodeForHTML( reReplace( data.author.website, "^https?://", "" ) )#</a></p></bx:if>
+			<p class="page-head__kicker"><a href="/authors">Authors</a></p>
+			<h1 class="page-head__title">#encodeForHTML( data.author.displayName )#</h1>
+			<bx:if len( data.author.bio )><p class="page-head__lede">#encodeForHTML( data.author.bio )#</p></bx:if>
+			<bx:if len( data.author.website )><p class="page-head__links"><a href="#encodeForHTMLAttribute( data.author.website )#" rel="me noopener">#encodeForHTML( reReplace( data.author.website, "^https?://", "" ) )#</a></p></bx:if>
 		</div>
 	</header>
-	<div class="post-list">
-		<bx:loop array="#data.paging.posts#" item="post">
-			<bx:include template="_postCard.bxm">
-		</bx:loop>
-	</div>
-	<bx:include template="_pagination.bxm">
+
+	<section aria-labelledby="bp-author-posts">
+		<div class="block-head">
+			<h2 id="bp-author-posts" class="block-head__title">#data.paging.total# #data.paging.total == 1 ? "post" : "posts"#</h2>
+		</div>
+		<div class="entry-list">
+			<bx:loop array="#data.paging.posts#" item="post">
+				<bx:include template="_postEntry.bxm">
+			</bx:loop>
+		</div>
+		<bx:include template="_pagination.bxm">
+	</section>
 </div>
 </bx:output>
 <bx:include template="_foot.bxm">

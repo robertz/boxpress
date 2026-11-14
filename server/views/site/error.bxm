@@ -1,10 +1,11 @@
 <bx:include template="_head.bxm">
 <bx:output>
-<div class="wrap wrap--narrow notice">
-	<h1 class="page-header__title">#encodeForHTML( len( data.heading ?: "" ) ? data.heading : "Something went wrong" )#</h1>
-	<p>#encodeForHTML( len( data.message ?: "" ) ? data.message : "The page couldn't be shown just now. Try again in a moment." )#</p>
+<div class="wrap wrap--narrow">
+	<header class="page-head">
+		<h1 class="page-head__title">#encodeForHTML( len( data.heading ?: "" ) ? data.heading : "Something went wrong" )#</h1>
+		<p class="page-head__lede">#encodeForHTML( len( data.message ?: "" ) ? data.message : "The page couldn't be shown just now. Try again in a moment." )# <a href="/">Go to the latest posts</a>.</p>
+	</header>
 	<bx:if len( data.detail ?: "" )><pre class="notice__detail">#encodeForHTML( data.detail )#</pre></bx:if>
-	<p><a href="/">Go to the latest posts</a></p>
 </div>
 </bx:output>
 <bx:include template="_foot.bxm">

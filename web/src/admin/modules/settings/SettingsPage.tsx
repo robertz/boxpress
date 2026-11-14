@@ -110,7 +110,7 @@ function SettingsForm({ initial }: { initial: SiteSettings }) {
 							component="input"
 							type="color"
 							aria-label="Pick the accent colour"
-							value={/^#[0-9a-f]{6}$/i.test(form.accentColor) ? form.accentColor : "#2563eb"}
+							value={/^#[0-9a-f]{6}$/i.test(form.accentColor) ? form.accentColor : "#4f46e5"}
 							onChange={(e: React.ChangeEvent<HTMLInputElement>) => update({ accentColor: e.target.value })}
 							sx={{ width: 48, height: 40, p: 0, border: 0, bgcolor: "transparent", cursor: "pointer" }}
 						/>

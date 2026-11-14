@@ -1,0 +1,16 @@
+<!--- A post as a text row: date, title, summary and its first tag. Expects `post` (labelled, with shortDateLabel). --->
+<bx:output>
+<article class="entry">
+	<time class="entry__date" datetime="#encodeForHTMLAttribute( post.publishedAt )#">#post.shortDateLabel#</time>
+	<div class="entry__body">
+		<h3 class="entry__title"><a href="#encodeForHTMLAttribute( post.url )#">#encodeForHTML( post.title )#</a></h3>
+		<bx:if len( post.excerpt )>
+		<p class="entry__summary">#encodeForHTML( post.excerpt )#</p>
+		</bx:if>
+		<p class="entry__meta">
+			<bx:if post.tags.len()><a href="/tag/#encodeForURL( post.tags[ 1 ].slug )#" class="entry__topic">#encodeForHTML( post.tags[ 1 ].name )#</a><span aria-hidden="true">&middot;</span></bx:if>
+			<span>#post.readingMinutes# min read</span>
+		</p>
+	</div>
+</article>
+</bx:output>

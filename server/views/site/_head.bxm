@@ -42,19 +42,37 @@
 </bx:if>
 </head>
 <body>
+<bx:set navPath = data.currentPath>
+<bx:set navWriting = navPath == "/" || left( navPath, 7 ) == "/posts/" || navPath == "/search">
+<bx:set navTags = navPath == "/tags" || left( navPath, 5 ) == "/tag/">
+<bx:set navAuthors = navPath == "/authors" || left( navPath, 8 ) == "/author/">
 <a class="skip-link" href="##bp-main">Skip to content</a>
 <header class="site-header">
 	<div class="wrap site-header__inner">
-		<a href="/" class="site-title">#encodeForHTML( data.site.title )#</a>
-		<nav class="site-nav" aria-label="Site">
-			<a href="/" #data.currentPath == "/" ? 'aria-current="page"' : ''#>Posts</a>
-			<a href="/tags" #data.currentPath == "/tags" || left( data.currentPath, 5 ) == "/tag/" ? 'aria-current="page"' : ''#>Tags</a>
-			<a href="/authors" #data.currentPath == "/authors" || left( data.currentPath, 8 ) == "/author/" ? 'aria-current="page"' : ''#>Authors</a>
+		<a href="/" class="site-header__logo">#encodeForHTML( data.site.title )#</a>
+		<nav class="site-header__nav" aria-label="Sections">
+			<a href="/" class="site-header__link" #navWriting ? 'aria-current="page"' : ''#>Writing</a>
+			<a href="/tags" class="site-header__link" #navTags ? 'aria-current="page"' : ''#>Tags</a>
+			<a href="/authors" class="site-header__link" #navAuthors ? 'aria-current="page"' : ''#>Authors</a>
 		</nav>
-		<form class="site-search" method="get" action="/search" role="search">
-			<label class="visually-hidden" for="bp-site-search">Search</label>
-			<input id="bp-site-search" type="search" name="q" placeholder="Search" value="#encodeForHTMLAttribute( data.query ?: "" )#">
+		<div class="site-header__spacer"></div>
+		<div class="site-header__actions">
+			<a href="/search" class="icon-button" aria-label="Search posts"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></a>
+			<a href="/feed.xml" class="icon-button" aria-label="RSS feed"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1.5" fill="currentColor"/></svg></a>
+			<button type="button" class="icon-button site-header__menu" aria-label="Open menu" aria-expanded="false" aria-controls="bp-menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+		</div>
+	</div>
+	<div class="mobile-menu" id="bp-menu" hidden>
+		<form class="search-box search-box--menu" method="get" action="/search" role="search">
+			<label class="visually-hidden" for="bp-menu-search">Search posts</label>
+			<input id="bp-menu-search" class="search-box__input" type="search" name="q" placeholder="Search posts">
 		</form>
+		<nav class="mobile-menu__links" aria-label="Sections">
+			<a href="/" class="mobile-menu__link">Writing</a>
+			<a href="/tags" class="mobile-menu__link">Tags</a>
+			<a href="/authors" class="mobile-menu__link">Authors</a>
+			<a href="/feed.xml" class="mobile-menu__link">RSS feed</a>
+		</nav>
 	</div>
 </header>
 <main id="bp-main" tabindex="-1">

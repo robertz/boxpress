@@ -1,25 +1,27 @@
 <bx:include template="_head.bxm">
 <bx:output>
-<div class="wrap">
-	<header class="page-header">
-		<h1 class="page-header__title">Authors</h1>
+<div class="wrap wrap--narrow">
+	<header class="page-head">
+		<h1 class="page-head__title">Authors</h1>
+		<p class="page-head__lede">Everyone who has published here.</p>
 	</header>
 	<bx:if data.authors.len()>
-	<ul class="author-list">
+	<div class="row-list">
 		<bx:loop array="#data.authors#" item="author">
-		<li class="author-card">
+		<article class="row">
 			<bx:if len( author.avatarUrl )>
-			<img class="author-card__avatar" src="#encodeForHTMLAttribute( author.avatarUrl )#" alt="">
+			<img class="avatar" src="#encodeForHTMLAttribute( author.avatarUrl )#" alt="" width="56" height="56" loading="lazy">
 			<bx:else>
-			<span class="author-card__avatar" aria-hidden="true">#encodeForHTML( author.initials )#</span>
+			<span class="avatar" aria-hidden="true">#encodeForHTML( author.initials )#</span>
 			</bx:if>
 			<div>
-				<p class="author-card__name"><a href="/author/#encodeForURL( author.username )#">#encodeForHTML( author.displayName )#</a></p>
-				<p class="author-card__bio">#author.postCount# #author.postCount == 1 ? "post" : "posts"#<bx:if len( author.bio )> &middot; #encodeForHTML( left( author.bio, 160 ) )#</bx:if></p>
+				<h2 class="row__name"><a href="/author/#encodeForURL( author.username )#">#encodeForHTML( author.displayName )#</a></h2>
+				<bx:if len( author.bio )><p class="row__text">#encodeForHTML( author.bio )#</p></bx:if>
+				<p class="row__meta">#author.postCount# #author.postCount == 1 ? "post" : "posts"#</p>
 			</div>
-		</li>
+		</article>
 		</bx:loop>
-	</ul>
+	</div>
 	<bx:else>
 	<p class="empty">No one has published yet.</p>
 	</bx:if>

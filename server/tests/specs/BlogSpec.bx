@@ -357,6 +357,58 @@ class extends="testbox.system.BaseSpec" {
 				} )
 			} )
 
+			describe( "Home page", () => {
+
+				it( "shows the intro, featured posts, recent posts as rows, and topics", () => {
+					svc.site.save( { tagline: "Notes on BoxLang", description: "Deep dives and small fixes." } )
+					var admin = signedIn()
+					admin.post( "/api/posts", { title: "Pinned piece", body: "x", excerpt: "The one to read first.", status: "published", featured: true, tags: [ "BoxLang" ], publishedAt: "2026-03-05T00:00:00Z" } )
+					admin.post( "/api/posts", { title: "Latest note", body: "y", status: "published", tags: [ "JVM" ], publishedAt: "2026-04-01T00:00:00Z" } )
+					var home = new ApiClient( baseUrl ).get( "/" ).body
+					expect( home ).toInclude( '<h1 class="intro__title">Notes on BoxLang</h1>' )
+					expect( home ).toInclude( "Deep dives and small fixes." )
+					expect( home ).toInclude( ">Featured</h2>" )
+					expect( reFind( 'class="feature".*Pinned piece', home ) ).toBeGT( 0 )
+					expect( home ).toInclude( ">Apr 1, 2026</time>" )
+					expect( reFind( 'class="entry__topic">JVM<', home ) ).toBeGT( 0 )
+					expect( home ).toInclude( 'class="topic-row__link"' )
+
+					admin.put( "/api/posts/#svc.db.query( "SELECT id FROM posts WHERE title = 'Pinned piece'" ).id#", { featured: false } )
+					expect( new ApiClient( baseUrl ).get( "/" ).body ).notToInclude( ">Featured</h2>" )
+				} )
+			} )
+
+			describe( "Site pages", () => {
+
+				it( "lists a tag's posts as rows under a topic filter, with the section marked in the header", () => {
+					var admin = signedIn()
+					admin.post( "/api/posts", { title: "Tagged one", body: "x", status: "published", tags: [ "BoxLang" ] } )
+					admin.post( "/api/posts", { title: "Other topic", body: "x", status: "published", tags: [ "JVM" ] } )
+					var page = new ApiClient( baseUrl ).get( "/tag/boxlang" ).body
+					expect( page ).toInclude( '<h1 class="page-head__title">BoxLang</h1>' )
+					expect( reFind( 'class="topic-filter__link" aria-current="page">BoxLang<', page ) ).toBeGT( 0 )
+					expect( page ).toInclude( 'class="topic-filter__link" >JVM<' )
+					expect( reFind( 'class="entry".*Tagged one', page ) ).toBeGT( 0 )
+					expect( page ).notToInclude( "Other topic" )
+					expect( page ).toInclude( 'href="/tags" class="site-header__link" aria-current="page"' )
+					expect( page ).notToInclude( "post-card" )
+				} )
+
+				it( "shows search results as rows, and a post with its kickers, byline and back link", () => {
+					var admin = signedIn()
+					var post = admin.post( "/api/posts", { title: "Findable piece", body: "Searchable words here.", excerpt: "A summary.", status: "published", tags: [ "Notes" ] } ).json
+					var reader = new ApiClient( baseUrl )
+					var results = reader.get( "/search?q=findable" ).body
+					expect( results ).toInclude( 'class="search-box__input"' )
+					expect( reFind( 'class="entry".*Findable piece', results ) ).toBeGT( 0 )
+					var page = reader.get( post.url ).body
+					expect( page ).toInclude( 'class="post__back"' )
+					expect( reFind( 'class="post-kicker">Notes<', page ) ).toBeGT( 0 )
+					expect( page ).toInclude( '<p class="post__excerpt">A summary.</p>' )
+					expect( page ).toInclude( 'href="/" class="site-header__link" aria-current="page"' )
+				} )
+			} )
+
 			describe( "Second review fixes", () => {
 
 				it( "counts only what it's told to, per key, and forgets a key when cleared", () => {

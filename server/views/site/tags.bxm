@@ -1,15 +1,19 @@
 <bx:include template="_head.bxm">
 <bx:output>
-<div class="wrap">
-	<header class="page-header">
-		<h1 class="page-header__title">Tags</h1>
+<div class="wrap wrap--narrow">
+	<header class="page-head">
+		<h1 class="page-head__title">Tags</h1>
+		<p class="page-head__lede">Every topic with something published, the most used first.</p>
 	</header>
 	<bx:if data.tags.len()>
-	<p class="tag-cloud">
+	<div class="row-list">
 		<bx:loop array="#data.tags#" item="tag">
-			<a href="/tag/#encodeForURL( tag.slug )#" class="tag-pill">#encodeForHTML( tag.name )# <span>#tag.posts#</span></a>
+		<div class="row row--plain">
+			<h2 class="row__name"><a href="/tag/#encodeForURL( tag.slug )#">#encodeForHTML( tag.name )#</a></h2>
+			<span class="row__count">#tag.posts# #tag.posts == 1 ? "post" : "posts"#</span>
+		</div>
 		</bx:loop>
-	</p>
+	</div>
 	<bx:else>
 	<p class="empty">No tags yet.</p>
 	</bx:if>

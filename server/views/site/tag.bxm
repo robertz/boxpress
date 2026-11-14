@@ -1,14 +1,22 @@
 <bx:include template="_head.bxm">
 <bx:output>
-<div class="wrap">
-	<header class="page-header">
-		<p class="page-header__kicker"><a href="/tags">Tags</a></p>
-		<h1 class="page-header__title">#encodeForHTML( data.tag.name )#</h1>
-		<p class="page-header__meta">#data.paging.total# #data.paging.total == 1 ? "post" : "posts"#</p>
+<div class="wrap wrap--narrow">
+	<header class="page-head">
+		<p class="page-head__kicker"><a href="/tags">Tags</a></p>
+		<h1 class="page-head__title">#encodeForHTML( data.tag.name )#</h1>
+		<p class="page-head__lede">#data.paging.total# #data.paging.total == 1 ? "post" : "posts"# tagged #encodeForHTML( data.tag.name )#.</p>
 	</header>
-	<div class="post-list">
+
+	<nav class="topic-filter" aria-label="Topics">
+		<a href="/" class="topic-filter__link">All</a>
+		<bx:loop array="#data.topics#" item="topic">
+			<a href="/tag/#encodeForURL( topic.slug )#" class="topic-filter__link" #topic.slug == data.tag.slug ? 'aria-current="page"' : ''#>#encodeForHTML( topic.name )#</a>
+		</bx:loop>
+	</nav>
+
+	<div class="entry-list">
 		<bx:loop array="#data.paging.posts#" item="post">
-			<bx:include template="_postCard.bxm">
+			<bx:include template="_postEntry.bxm">
 		</bx:loop>
 	</div>
 	<bx:include template="_pagination.bxm">

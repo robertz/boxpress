@@ -1,9 +1,11 @@
 <bx:include template="_head.bxm">
 <bx:output>
-<div class="wrap wrap--narrow notice">
-	<h1 class="page-header__title">Page not found</h1>
-	<p>There's nothing at this address. It may have moved, or never existed.</p>
-	<p><a href="/">Go to the latest posts</a> or <a href="/search">search</a>.</p>
+<div class="wrap wrap--narrow">
+	<header class="page-head">
+		<p class="page-head__kicker">404</p>
+		<h1 class="page-head__title">Page not found</h1>
+		<p class="page-head__lede">There's nothing at this address. It may have moved, or never existed. <a href="/">Go to the latest posts</a> or <a href="/search">search</a>.</p>
+	</header>
 </div>
 </bx:output>
 <bx:include template="_foot.bxm">
